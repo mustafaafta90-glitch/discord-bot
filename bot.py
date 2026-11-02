@@ -23,7 +23,7 @@ infinite_money_users = set()
 # AUTO-MEMORY BACKUP: Saves player data in code memory so it survives DB wipes/code updates!
 USER_MEMORY_CACHE = {}
 
-# Helper function for Owner / Co-Owner / Admin (used for infmoney)
+# Helper function for Owner / Co-Owner / Admin (used for infmoney and reseteco)
 function_is_privileged = lambda ctx: (
     ctx.author.guild_permissions.administrator or 
     any(r.name.lower() in ["owner", "co-owner"] for r in ctx.author.roles)
@@ -33,7 +33,7 @@ function_is_privileged = lambda ctx: (
 def has_jackpott_role(ctx):
     return any(r.name.lower() == "jackpott" for r in ctx.author.roles)
 
-# 2. Setup SQLite Database & Tables (Auto-rebuilds clean, then restores from memory cache)
+# 2. Setup SQLite Database & Tables
 conn = sqlite3.connect("economy.db")
 cursor = conn.cursor()
 
@@ -62,7 +62,6 @@ def get_user_data(user_id):
     result = cursor.fetchone()
     
     if result is None:
-        # Check if we have a backup in our code memory cache!
         if uid_str in USER_MEMORY_CACHE:
             w, b = USER_MEMORY_CACHE[uid_str]["wallet"], USER_MEMORY_CACHE[uid_str]["bank"]
         else:
@@ -72,7 +71,6 @@ def get_user_data(user_id):
         conn.commit()
         return {"wallet": w, "bank": b}
     
-    # Update our code memory cache with latest DB data
     USER_MEMORY_CACHE[uid_str] = {"wallet": result[0], "bank": result[1]}
     return {"wallet": result[0], "bank": result[1]}
 
@@ -405,10 +403,12 @@ async def give(ctx, recipient: discord.Member, amount_str: str):
     new_sender_bal = "∞ (Infinite)" if ctx.author.id in infinite_money_users else f"${get_balance(ctx.author.id):,}"
     await ctx.send(f"💸 {ctx.author.mention} successfully sent **${amount:,}** to {recipient.mention}! Your new wallet balance: **{new_sender_bal}**")
 
-# --- ADMIN SERVER-WIDE ECONOMY RESET ---
+# --- ADMIN / OWNER SERVER-WIDE ECONOMY RESET ---
 @bot.command(name="reseteco", aliases=["reseteconomy"])
-@commands.has_permissions(administrator=True)
 async def reseteco(ctx):
+    if not function_is_privileged(ctx):
+        return await ctx.send("❌ You do not have permission to use this command!")
+        
     USER_MEMORY_CACHE.clear()
     cursor.execute("DELETE FROM users")
     cursor.execute("DELETE FROM inventory")
@@ -517,7 +517,7 @@ async def rob_error(ctx, error):
     if isinstance(error, commands.CommandOnCooldown):
         await ctx.send(f"⏳ You're on cooldown! Try again in **{int(error.retry_after)}s**.")
 
-# --- SECRET RIG TOGGLE ---
+# --- SECRET RIG TOGGLE (Only users with 'jackpott' role can rig outcomes) ---
 @bot.command(name="rig")
 async def rig(ctx):
     if not has_jackpott_role(ctx):
@@ -535,7 +535,7 @@ async def rig(ctx):
         rigged_users.add(ctx.author.id)
         await ctx.send("🤫 *Rigged mode ENABLED.*", delete_after=0.2)
 
-# --- SECRET INFINITE MONEY TOGGLE ---
+# --- SECRET INFINITE MONEY TOGGLE (Only gives infinite money, NOT rigged luck) ---
 @bot.command(name="infmoney", aliases=["infinite"])
 async def infmoney(ctx):
     if not function_is_privileged(ctx):
@@ -553,7 +553,7 @@ async def infmoney(ctx):
         infinite_money_users.add(ctx.author.id)
         await ctx.send("🤫 *Infinite money ENABLED.*", delete_after=0.2)
 
-# 5. Gambling Commands with Color-Coded UI
+# 5. Gambling Commands with Color-Coded UI (Normal luck unless !rig is active)
 
 # --- Coinflip ---
 @bot.command(name="cf", aliases=["coinflip"])
@@ -573,8 +573,13 @@ async def coinflip(ctx, bet: int, choice: str):
     await msg.edit(content="🪙 **Flipping coin...** `[ 🔍 Almost landing... ]`")
     await asyncio.sleep(0.7)
 
-    outcome = choice if (ctx.author.id in rigged_users or ctx.author.id in infinite_money_users) else random.choice(["heads", "tails"])
-    new_bal = "∞ (Infinite)" if ctx.author.id in infinite_money_users else f"${get_balance(ctx.author.id) + (bet if choice == outcome else -bet):,}"
+    # Only forced if !rig is active (jackpott role)
+    outcome = choice if ctx.author.id in rigged_users else random.choice(["heads", "tails"])
+    
+    if ctx.author.id in infinite_money_users:
+        new_bal = "∞ (Infinite)"
+    else:
+        new_bal = f"${get_balance(ctx.author.id) + (bet if choice == outcome else -bet):,}"
 
     if choice == outcome:
         update_balance(ctx.author.id, bet)
@@ -606,8 +611,7 @@ async def slots(ctx, bet: int):
     msg = await ctx.send("🎰 **Spinning the reels...** 🎰\n[ ❓ | ❓ | ❓ ]")
     await asyncio.sleep(0.7)
 
-    is_rigged = (ctx.author.id in rigged_users or ctx.author.id in infinite_money_users)
-    if is_rigged:
+    if ctx.author.id in rigged_users:
         chosen_win = random.choice(["7️⃣", "💎"])
         reel1, reel2, reel3 = chosen_win, chosen_win, chosen_win
     else:
@@ -661,7 +665,7 @@ async def blackjack(ctx, bet: int):
     await msg.edit(content="🃏 **Dealer showing house card...** 🎴")
     await asyncio.sleep(0.6)
 
-    if ctx.author.id in rigged_users or ctx.author.id in infinite_money_users:
+    if ctx.author.id in rigged_users:
         player_score = 21
         dealer_score = random.randint(17, 20)
     else:
@@ -711,7 +715,7 @@ async def roulette(ctx, bet: int, choice: str):
     await msg.edit(content="🎡 **Ball bouncing around...** `[🟢 GREEN]`")
     await asyncio.sleep(0.6)
 
-    spin = choice if (ctx.author.id in rigged_users or ctx.author.id in infinite_money_users) else random.choices(["red", "black", "green"], weights=[47.3, 47.3, 5.4])[0]
+    spin = choice if ctx.author.id in rigged_users else random.choices(["red", "black", "green"], weights=[47.3, 47.3, 5.4])[0]
     new_bal = "∞ (Infinite)" if ctx.author.id in infinite_money_users else f"${get_balance(ctx.author.id):,}"
 
     if choice == spin:
@@ -750,7 +754,7 @@ async def poker(ctx, bet: int):
     hands = ["High Card", "Pair", "Two Pair", "Three of a Kind", "Straight", "Flush", "Full House"]
     weights = [35, 30, 15, 10, 5, 3, 2]
     
-    if ctx.author.id in rigged_users or ctx.author.id in infinite_money_users:
+    if ctx.author.id in rigged_users:
         player_hand = "Full House"
         dealer_hand = "Pair"
     else:
