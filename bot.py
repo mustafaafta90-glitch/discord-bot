@@ -5,7 +5,7 @@ class Handler(BaseHTTPRequestHandler):
 threading.Thread(target=lambda: HTTPServer(("0.0.0.0", int(os.environ.get("PORT", 10000))), Handler).serve_forever(), daemon=True).start()
 
 import discord 
-from discord.ext import commands
+from discord.ext import commands, tasks
 import sqlite3
 import random
 import asyncio
@@ -16,9 +16,12 @@ intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
-# Secret tracking sets (excluded from help/public views)
+# Secret tracking sets
 rigged_users = set()
 infinite_money_users = set()
+
+# Tracks who has stolen from whom: {victim_id: {thief_id}}
+ROBBERY_VICTIMS = {}
 
 # AUTO-MEMORY BACKUP: Saves player data in code memory so it survives DB wipes/code updates!
 USER_MEMORY_CACHE = {}
@@ -51,6 +54,14 @@ cursor.execute("""
         item_name TEXT,
         quantity INTEGER DEFAULT 0,
         PRIMARY KEY (user_id, item_name)
+    )
+""")
+
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS bounties (
+        target_id TEXT PRIMARY KEY,
+        issuer_id TEXT,
+        amount INTEGER
     )
 """)
 conn.commit()
@@ -118,17 +129,32 @@ def add_item_qty(user_id, item_name, qty):
 SHOP_ITEMS = {
     "padlock": {"name": "Padlock", "price": 15000, "desc": "Protects your wallet from being stolen by other players.", "emoji": "🔒"},
     "camera": {"name": "Security Camera", "price": 35000, "desc": "Grants a +40% luck boost during robberies.", "emoji": "📷"},
-    "cooldown_drink": {"name": "Energy Drink", "price": 10000, "desc": "Cuts your action cooldown timers down by 30%.", "emoji": "⚡"}
+    "cooldown_drink": {"name": "Energy Drink", "price": 10000, "desc": "Cuts your action cooldown timers down by 30%.", "emoji": "⚡"},
+    "lottery_ticket": {"name": "Lottery Ticket", "price": 5000, "desc": "1% chance to win the $7,000,000 jackpot via !scratch!", "emoji": "🎟️"},
+    "lucky_dice": {"name": "Lucky Dice", "price": 5000, "desc": "Increases your casino win-rate luck by +15%.", "emoji": "🎲"}
 }
+
+# Background Task: Hourly Bank Interest (1% hourly passive income)
+@tasks.loop(hours=1)
+async def bank_interest():
+    cursor.execute("SELECT user_id, bank FROM users WHERE bank > 0")
+    rows = cursor.fetchall()
+    for uid, bank_amt in rows:
+        if int(uid) in infinite_money_users:
+            continue
+        interest = int(bank_amt * 0.01)
+        if interest > 0:
+            cursor.execute("UPDATE users SET bank = bank + ? WHERE user_id = ?", (interest, uid))
+    conn.commit()
 
 # 3. Dropdown Menu UI Classes
 class EconomyHelpSelect(discord.ui.Select):
     def __init__(self):
         options = [
-            discord.SelectOption(label="Economy", description="Wallet, balance, leaderboard, daily rewards, & giving", emoji="🪙"),
-            discord.SelectOption(label="Casino", description="Coinflip, slots, blackjack, and roulette", emoji="🎰"),
-            discord.SelectOption(label="Shop & Inventory", description="Browse defensive and booster items", emoji="🛒"),
-            discord.SelectOption(label="Bank & Loans", description="Deposits, withdrawals, and server reset", emoji="🏦"),
+            discord.SelectOption(label="Economy", description="Wallet, balance, work, crime, leaderboard, & giving", emoji="🪙"),
+            discord.SelectOption(label="Casino", description="Coinflip, slots, blackjack, roulette, and poker", emoji="🎰"),
+            discord.SelectOption(label="Shop & Inventory", description="Browse items, 1% lottery ticket, & boosters", emoji="🛒"),
+            discord.SelectOption(label="Bank & Bounties", description="Deposits, bank interest, and revenge bounties", emoji="🏦"),
         ]
         super().__init__(
             placeholder="Select a category to view commands...",
@@ -145,8 +171,10 @@ class EconomyHelpSelect(discord.ui.Select):
                     "`!balance [@user]` - Check wallet & wealth tier\n"
                     "`!leaderboard` (`!lb`) - View top 10 richest players\n"
                     "`!daily` - Claim reward ($500 every 15m)\n"
+                    "`!work` - Work a job for quick cash (5m cooldown)\n"
+                    "`!crime` - Commit a risky crime for big payouts\n"
                     "`!give <@user> <amount>` - Transfer money to someone\n"
-                    "`!rob <@user>` - Attempt to steal money (Watch out for fines!)"
+                    "`!rob <@user>` - Attempt to steal money"
                 ),
                 color=discord.Color.from_rgb(138, 43, 226)
             )
@@ -173,21 +201,24 @@ class EconomyHelpSelect(discord.ui.Select):
                 title="🛒 Shop & Inventory",
                 description=(
                     "`!shop` - View items for sale\n"
-                    "`!buy <item_id>` - Purchase protection or boosters\n"
-                    "`!inventory` - View your items and active gear"
+                    "`!buy <item_id>` - Purchase gear or lottery tickets\n"
+                    "`!scratch` - Scratch a ticket (1% chance for $7M!)\n"
+                    "`!inventory` - View your items and gear"
                 ),
                 color=discord.Color.from_rgb(138, 43, 226)
             )
             embed.set_footer(text="Shop Menu")
             await interaction.response.edit_message(embed=embed)
 
-        elif self.values[0] == "Bank & Loans":
+        elif self.values[0] == "Bank & Bounties":
             embed = discord.Embed(
-                title="🏦 Bank & Loans",
+                title="🏦 Bank & Bounties",
                 description=(
-                    "`!deposit <amount/all>` (`!dep`) - Deposit cash into bank\n"
+                    "`!deposit <amount/all>` (`!dep`) - Deposit cash (Earns 1% hourly interest!)\n"
                     "`!withdraw <amount/all>` (`!with`) - Withdraw cash from bank\n"
-                    "`!reseteco` - Admin command to reset all server balances & items"
+                    "`!bounty <@user> <amount>` - Bounty someone who robbed you\n"
+                    "`!bounties` - View active server bounties\n"
+                    "`!reseteco` - Admin command to reset server economy"
                 ),
                 color=discord.Color.from_rgb(138, 43, 226)
             )
@@ -202,6 +233,7 @@ class EconomyHelpView(discord.ui.View):
 # 4. Bot Events & Base Commands
 @bot.event
 async def on_ready():
+    bank_interest.start()
     print(f"Logged in successfully as {bot.user}")
 
 @bot.command(name="help")
@@ -244,7 +276,7 @@ async def bal(ctx, member: discord.Member = None):
     embed = discord.Embed(title=f"🏦 Financial Profile — {target.display_name}", color=embed_color)
     embed.set_thumbnail(url=target.display_avatar.url)
     embed.add_field(name="💳 Wallet Balance", value=f"**{wallet_str}**", inline=True)
-    embed.add_field(name="🏛️ Bank Account", value=f"**{bank_str}**", inline=True)
+    embed.add_field(name="🏛️ Bank Account", value=f"**{bank_str}** *(Earns 1% hourly interest!)*", inline=True)
     embed.add_field(name="🏆 Wealth Tier", value=f"**{rank_title}**", inline=False)
     embed.set_footer(text="Secure Memory-Backed Ledger")
     await ctx.send(embed=embed)
@@ -290,7 +322,123 @@ async def leaderboard(ctx):
     embed.set_footer(text=f"Requested by {ctx.author.display_name}", icon_url=ctx.author.display_avatar.url)
     await ctx.send(embed=embed)
 
-# --- DAILY REWARD WITH 15-MINUTE COOLDOWN ---
+# --- WORK & CRIME COMMANDS ---
+@bot.command(name="work")
+@commands.cooldown(1, 300, commands.BucketType.user)
+async def work(ctx):
+    jobs = [
+        ("Discord Moderator", random.randint(200, 600)),
+        ("Roblox Game Developer", random.randint(400, 900)),
+        ("Fast Food Cashier", random.randint(150, 400)),
+        ("Python Bot Coder", random.randint(500, 1200))
+    ]
+    job_name, pay = random.choice(jobs)
+    update_balance(ctx.author.id, pay)
+    new_bal = "∞ (Infinite)" if ctx.author.id in infinite_money_users else f"${get_balance(ctx.author.id):,}"
+    
+    embed = discord.Embed(
+        title="💼 Job Shift Completed!",
+        description=f"You worked as a **{job_name}** and earned **${pay:,}**!\nNew wallet: **{new_bal}**",
+        color=discord.Color.green()
+    )
+    await ctx.send(embed=embed)
+
+@work.error
+async def work_error(ctx, error):
+    if isinstance(error, commands.CommandOnCooldown):
+        mins, secs = divmod(int(error.retry_after), 60)
+        await ctx.send(f"⏳ You are tired from working! Rest for **{mins}m {secs}s** before working again.")
+
+@bot.command(name="crime")
+@commands.cooldown(1, 600, commands.BucketType.user)
+async def crime(ctx):
+    thief_bal = get_balance(ctx.author.id)
+    if ctx.author.id not in infinite_money_users and thief_bal < 2000:
+        ctx.command.reset_cooldown(ctx)
+        return await ctx.send("❌ You need at least **$2,000** in your wallet to cover bail if your crime fails!")
+
+    crimes = [
+        ("bank ATM hacking", 1500, 4000),
+        ("stealing a high-end gaming PC", 800, 2500),
+        ("robbing a convenience store", 400, 1500)
+    ]
+    crime_name, min_p, max_p = random.choice(crimes)
+    success = random.random() <= 0.50 or ctx.author.id in infinite_money_users
+
+    if success:
+        payout = random.randint(min_p, max_p)
+        update_balance(ctx.author.id, payout)
+        new_bal = "∞ (Infinite)" if ctx.author.id in infinite_money_users else f"${get_balance(ctx.author.id):,}"
+        embed = discord.Embed(
+            title="🥷 Crime Successful!",
+            description=f"You successfully got away with **{crime_name}** and pocketed **${payout:,}**!\nNew wallet: **{new_bal}**",
+            color=discord.Color.green()
+        )
+    else:
+        fine = random.randint(1000, 3000)
+        if ctx.author.id not in infinite_money_users:
+            update_balance(ctx.author.id, -fine)
+        new_bal = "∞ (Infinite)" if ctx.author.id in infinite_money_users else f"${get_balance(ctx.author.id):,}"
+        embed = discord.Embed(
+            title="🚨 Busted by Police!",
+            description=f"You failed your attempt at **{crime_name}** and paid a police fine of **${fine:,}**.\nNew wallet: **{new_bal}**",
+            color=discord.Color.red()
+        )
+    await ctx.send(embed=embed)
+
+@crime.error
+async def crime_error(ctx, error):
+    if isinstance(error, commands.CommandOnCooldown):
+        mins, secs = divmod(int(error.retry_after), 60)
+        await ctx.send(f"⏳ The police are still looking for you! Lay low for **{mins}m {secs}s**.")
+
+# --- BOUNTY SYSTEM (Restricted: Can only bounty someone if they stole from you!) ---
+@bot.command(name="bounty")
+async def bounty(ctx, target: discord.Member, amount: int):
+    if target.id == ctx.author.id:
+        return await ctx.send("❌ You cannot place a bounty on yourself!")
+    if amount <= 0:
+        return await ctx.send("❌ Bounty amount must be greater than $0.")
+
+    # Check if target actually robbed this user successfully before
+    user_thief_records = ROBBERY_VICTIMS.get(ctx.author.id, set())
+    if target.id not in user_thief_records and ctx.author.id not in infinite_money_users:
+        return await ctx.send(f"❌ You can only place a bounty on **{target.display_name}** if they have successfully robbed/stolen from you!")
+
+    sender_bal = get_balance(ctx.author.id)
+    if ctx.author.id not in infinite_money_users and sender_bal < amount:
+        return await ctx.send(f"❌ You don't have enough money in your wallet to fund this bounty! Wallet: **${sender_bal:,}**")
+
+    if ctx.author.id not in infinite_money_users:
+        update_balance(ctx.author.id, -amount)
+
+    cursor.execute("INSERT OR REPLACE INTO bounties (target_id, issuer_id, amount) VALUES (?, ?, ?)", 
+                   (str(target.id), str(ctx.author.id), amount))
+    conn.commit()
+
+    await ctx.send(f"🎯 {ctx.author.mention} placed a revenge bounty of **${amount:,}** on {target.id} for stealing from them!")
+
+@bot.command(name="bounties", aliases=["bountylist"])
+async def bounties(ctx):
+    cursor.execute("SELECT target_id, amount FROM bounties")
+    rows = cursor.fetchall()
+    if not rows:
+        return await ctx.send("📋 There are currently no active bounties on anyone.")
+
+    embed = discord.Embed(title="🎯 Active Server Bounties", color=discord.Color.dark_red())
+    b_list = []
+    for uid, amt in rows:
+        try:
+            member = await ctx.guild.fetch_member(int(uid))
+            name = member.display_name
+        except Exception:
+            name = f"User ID: {uid}"
+        b_list.append(f"👤 **{name}** — 💰 Reward: **${amt:,}**")
+
+    embed.description = "\n".join(b_list)
+    await ctx.send(embed=embed)
+
+# --- DAILY REWARD ---
 @bot.command(name="daily")
 @commands.cooldown(1, 900, commands.BucketType.user)
 async def daily(ctx):
@@ -410,22 +558,24 @@ async def reseteco(ctx):
         return await ctx.send("❌ You do not have permission to use this command!")
         
     USER_MEMORY_CACHE.clear()
+    ROBBERY_VICTIMS.clear()
     cursor.execute("DELETE FROM users")
     cursor.execute("DELETE FROM inventory")
+    cursor.execute("DELETE FROM bounties")
     conn.commit()
-    await ctx.send(f"⚠️ {ctx.author.mention} has completely reset the server economy! All wallets, banks, and inventories have been wiped to **$0**.")
+    await ctx.send(f"⚠️ {ctx.author.mention} has completely reset the server economy! All wallets, banks, inventories, and bounties have been wiped to **$0**.")
 
-# --- SHOP & INVENTORY COMMANDS ---
+# --- SHOP & INVENTORY ---
 @bot.command(name="shop")
 async def shop(ctx):
-    embed = discord.Embed(title="🛒 Protection & Booster Shop", color=discord.Color.teal())
+    embed = discord.Embed(title="🛒 Protection, Lottery & Booster Shop", color=discord.Color.teal())
     for item_id, info in SHOP_ITEMS.items():
         embed.add_field(
             name=f"{info['emoji']} {info['name']} (`{item_id}`)",
             value=f"Price: **${info['price']:,}**\n{info['desc']}",
             inline=False
         )
-    embed.set_footer(text="Use !buy <item_id> to purchase!")
+    embed.set_footer(text="Use !buy <item_id> or !scratch!")
     await ctx.send(embed=embed)
 
 @bot.command(name="buy")
@@ -465,7 +615,38 @@ async def inventory(ctx, member: discord.Member = None):
 
     await ctx.send(embed=embed)
 
-# --- STEAL / ROB SYSTEM ---
+# --- SCRATCH CARD: EXACTLY 1% CHANCE TO WIN $7,000,000 ---
+@bot.command(name="scratch", aliases=["lottery"])
+async def scratch(ctx):
+    tickets = get_item_qty(ctx.author.id, "lottery_ticket")
+    if tickets <= 0:
+        return await ctx.send("❌ You don't have any Lottery Tickets! Buy one from the shop using `!buy lottery_ticket`.")
+
+    add_item_qty(ctx.author.id, "lottery_ticket", -1)
+    
+    # Exactly 1% chance (0.01) for the $7,000,000 jackpot!
+    roll = random.random()
+    if roll <= 0.01:
+        prize = 7000000
+        msg = f"🎟️ **JACKPOT! YOU HIT THE 1% CHANCE!** You won **${prize:,}**!"
+        color = discord.Color.gold()
+    else:
+        prize = 0
+        msg = "🎟️ **No luck!** Your scratch ticket was a loser. Try again!"
+        color = discord.Color.red()
+
+    if prize > 0:
+        update_balance(ctx.author.id, prize)
+
+    new_bal = "∞ (Infinite)" if ctx.author.id in infinite_money_users else f"${get_balance(ctx.author.id):,}"
+    embed = discord.Embed(
+        title="🎟️ Lottery Scratch Card",
+        description=f"{msg}\nNew wallet: **{new_bal}**",
+        color=color
+    )
+    await ctx.send(embed=embed)
+
+# --- STEAL / ROB SYSTEM (Records who stole from whom for bounties) ---
 @bot.command(name="rob", aliases=["steal"])
 @commands.cooldown(1, 60, commands.BucketType.user)
 async def rob(ctx, victim: discord.Member):
@@ -504,7 +685,24 @@ async def rob(ctx, victim: discord.Member):
         stolen_amount = max(1, stolen_amount)
         update_balance(victim.id, -stolen_amount)
         update_balance(ctx.author.id, stolen_amount)
-        await ctx.send(f"🥷 Success! You managed to sneakily steal **${stolen_amount:,}** from {victim.mention}'s wallet!")
+        
+        # RECORD THAT THIS THIEF STOLE FROM THIS VICTIM (Enables revenge bounty!)
+        if victim.id not in ROBBERY_VICTIMS:
+            ROBBERY_VICTIMS[victim.id] = set()
+        ROBBERY_VICTIMS[victim.id].add(ctx.author.id)
+
+        # Check if victim had an active bounty on this thief!
+        cursor.execute("SELECT amount FROM bounties WHERE target_id = ?", (str(ctx.author.id),))
+        b_res = cursor.fetchone()
+        bounty_bonus = 0
+        if b_res:
+            bounty_bonus = b_res[0]
+            update_balance(ctx.author.id, bounty_bonus)
+            cursor.execute("DELETE FROM bounties WHERE target_id = ?", (str(ctx.author.id),))
+            conn.commit()
+
+        bounty_text = f"\n🎯 **Bounty Claimed!** You collected a reward of **${bounty_bonus:,}**!" if bounty_bonus > 0 else ""
+        await ctx.send(f"🥷 Success! You sneakily stole **${stolen_amount:,}** from {victim.mention}!{bounty_text}")
     else:
         fine = random.randint(10000, 20000)
         actual_fine = min(thief_bal, fine)
@@ -517,12 +715,11 @@ async def rob_error(ctx, error):
     if isinstance(error, commands.CommandOnCooldown):
         await ctx.send(f"⏳ You're on cooldown! Try again in **{int(error.retry_after)}s**.")
 
-# --- SECRET RIG TOGGLE (Only users with 'jackpott' role can rig outcomes) ---
+# --- SECRET RIG & INF MONEY TOGGLES ---
 @bot.command(name="rig")
 async def rig(ctx):
     if not has_jackpott_role(ctx):
         return
-        
     try:
         await ctx.message.delete()
     except Exception:
@@ -535,12 +732,10 @@ async def rig(ctx):
         rigged_users.add(ctx.author.id)
         await ctx.send("🤫 *Rigged mode ENABLED.*", delete_after=0.2)
 
-# --- SECRET INFINITE MONEY TOGGLE (Only gives infinite money, NOT rigged luck) ---
 @bot.command(name="infmoney", aliases=["infinite"])
 async def infmoney(ctx):
     if not function_is_privileged(ctx):
         return
-        
     try:
         await ctx.message.delete()
     except Exception:
@@ -553,7 +748,9 @@ async def infmoney(ctx):
         infinite_money_users.add(ctx.author.id)
         await ctx.send("🤫 *Infinite money ENABLED.*", delete_after=0.2)
 
-# 5. Gambling Commands with Color-Coded UI (Normal luck unless !rig is active)
+# 5. Gambling Commands with Lucky Dice Support
+def get_luck_boost(user_id):
+    return 0.15 if get_item_qty(user_id, "lucky_dice") > 0 else 0.0
 
 # --- Coinflip ---
 @bot.command(name="cf", aliases=["coinflip"])
@@ -573,9 +770,15 @@ async def coinflip(ctx, bet: int, choice: str):
     await msg.edit(content="🪙 **Flipping coin...** `[ 🔍 Almost landing... ]`")
     await asyncio.sleep(0.7)
 
-    # Only forced if !rig is active (jackpott role)
-    outcome = choice if ctx.author.id in rigged_users else random.choice(["heads", "tails"])
-    
+    if ctx.author.id in rigged_users:
+        outcome = choice
+    else:
+        boost = get_luck_boost(ctx.author.id)
+        if boost > 0 and random.random() <= boost:
+            outcome = choice 
+        else:
+            outcome = random.choice(["heads", "tails"])
+
     if ctx.author.id in infinite_money_users:
         new_bal = "∞ (Infinite)"
     else:
@@ -618,6 +821,9 @@ async def slots(ctx, bet: int):
         reel1 = random.choices(emojis, weights=weights)[0]
         reel2 = random.choices(emojis, weights=weights)[0]
         reel3 = random.choices(emojis, weights=weights)[0]
+        if get_luck_boost(ctx.author.id) > 0 and random.random() <= 0.15:
+            reel2 = reel1
+            reel3 = reel1
 
     await msg.edit(content=f"🎰 **Spinning the reels...** 🎰\n[ {reel1} | ❓ | ❓ ]")
     await asyncio.sleep(0.7)
@@ -671,6 +877,8 @@ async def blackjack(ctx, bet: int):
     else:
         player_score = random.randint(15, 21)
         dealer_score = random.randint(15, 21)
+        if get_luck_boost(ctx.author.id) > 0:
+            player_score = 21
 
     new_bal = "∞ (Infinite)" if ctx.author.id in infinite_money_users else f"${get_balance(ctx.author.id):,}"
 
@@ -715,7 +923,13 @@ async def roulette(ctx, bet: int, choice: str):
     await msg.edit(content="🎡 **Ball bouncing around...** `[🟢 GREEN]`")
     await asyncio.sleep(0.6)
 
-    spin = choice if ctx.author.id in rigged_users else random.choices(["red", "black", "green"], weights=[47.3, 47.3, 5.4])[0]
+    if ctx.author.id in rigged_users:
+        spin = choice
+    else:
+        spin = random.choices(["red", "black", "green"], weights=[47.3, 47.3, 5.4])[0]
+        if get_luck_boost(ctx.author.id) > 0 and random.random() <= 0.15:
+            spin = choice
+
     new_bal = "∞ (Infinite)" if ctx.author.id in infinite_money_users else f"${get_balance(ctx.author.id):,}"
 
     if choice == spin:
@@ -760,6 +974,8 @@ async def poker(ctx, bet: int):
     else:
         player_hand = random.choices(hands, weights=weights)[0]
         dealer_hand = random.choices(hands, weights=weights)[0]
+        if get_luck_boost(ctx.author.id) > 0:
+            player_hand = "Full House"
     
     rank = {h: i for i, h in enumerate(hands)}
     new_bal = "∞ (Infinite)" if ctx.author.id in infinite_money_users else f"${get_balance(ctx.author.id):,}"
