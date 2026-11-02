@@ -248,14 +248,12 @@ async def leaderboard(ctx):
     if not rows:
         return await ctx.send("❌ No economy data found yet!")
 
-    # Calculate total wealth (wallet + bank) for each user
     user_wealth = []
     for row in rows:
         uid, wallet, bank = row
         total = 999999999999999 if int(uid) in infinite_money_users else (wallet + bank)
         user_wealth.append((uid, total))
 
-    # Sort descending by total wealth
     user_wealth.sort(key=lambda x: x[1], reverse=True)
 
     embed = discord.Embed(
@@ -284,7 +282,7 @@ async def leaderboard(ctx):
 
 # --- DAILY REWARD WITH 15-MINUTE COOLDOWN ---
 @bot.command(name="daily")
-@commands.cooldown(1, 900, commands.BucketType.user)  # 900 seconds = 15 minutes
+@commands.cooldown(1, 900, commands.BucketType.user)
 async def daily(ctx):
     update_balance(ctx.author.id, 500)
     new_bal = get_balance(ctx.author.id)
@@ -458,7 +456,6 @@ async def rob(ctx, victim: discord.Member):
         ctx.command.reset_cooldown(ctx)
         return await ctx.send("❌ You need at least **$5,000** in your wallet to fund a robbery attempt!")
 
-    # Check if the victim is too broke in their wallet
     if victim_bal <= 0:
         ctx.command.reset_cooldown(ctx)
         return await ctx.send(f"💀 **{victim.display_name}** is too broke! They have no cash in their wallet.")
@@ -528,7 +525,7 @@ async def infmoney(ctx):
         infinite_money_users.add(ctx.author.id)
         await ctx.send("🤫 *Infinite money ENABLED.*", delete_after=0.2)
 
-# 5. Fully Suspenseful Animated Gambling Commands
+# 5. Fully Suspenseful Animated Gambling Commands with Color-Coded Embed UIs
 
 # --- Coinflip ---
 @bot.command(name="cf", aliases=["coinflip"])
@@ -549,17 +546,26 @@ async def coinflip(ctx, bet: int, choice: str):
     await asyncio.sleep(0.7)
 
     outcome = choice if (ctx.author.id in rigged_users or ctx.author.id in infinite_money_users) else random.choice(["heads", "tails"])
+    new_bal = "∞ (Infinite)" if ctx.author.id in infinite_money_users else f"${get_balance(ctx.author.id) + (bet if choice == outcome else -bet):,}"
 
     if choice == outcome:
         update_balance(ctx.author.id, bet)
-        new_bal = "∞ (Infinite)" if ctx.author.id in infinite_money_users else f"${get_balance(ctx.author.id):,}"
-        await msg.edit(content=f"🪙 It landed on **{outcome.upper()}**! You won **${bet:,}**! {ctx.author.mention}, new wallet: **{new_bal}**")
+        embed = discord.Embed(
+            title="🪙 Coinflip — VICTORY!",
+            description=f"It landed on **{outcome.upper()}**!\n{ctx.author.mention}, you won **${bet:,}**!\nNew wallet: **{new_bal}**",
+            color=discord.Color.green()
+        )
     else:
         update_balance(ctx.author.id, -bet)
-        new_bal = "∞ (Infinite)" if ctx.author.id in infinite_money_users else f"${get_balance(ctx.author.id):,}"
-        await msg.edit(content=f"🪙 It landed on **{outcome.upper()}**! You lost **${bet:,}**. {ctx.author.mention}, new wallet: **{new_bal}**")
+        embed = discord.Embed(
+            title="🪙 Coinflip — DEFEAT",
+            description=f"It landed on **{outcome.upper()}**!\n{ctx.author.mention}, you lost **${bet:,}**.\nNew wallet: **{new_bal}**",
+            color=discord.Color.red()
+        )
 
-# --- Slots (Balanced: No 2x small wins) ---
+    await msg.edit(content=None, embed=embed)
+
+# --- Slots ---
 @bot.command(name="slots")
 async def slots(ctx, bet: int):
     current_bal = get_balance(ctx.author.id)
@@ -589,20 +595,29 @@ async def slots(ctx, bet: int):
     if reel1 == reel2 == reel3:
         if reel1 == "7️⃣":
             winnings = bet * 10
-            result_text = f"🚨 **TRIPLE 7s JACKPOT!** 🎰 You won **${winnings:,}** (10x)!"
+            desc = f"🚨 **TRIPLE 7s JACKPOT!** (10x)\nYou won **${winnings:,}**!"
         elif reel1 == "💎":
             winnings = bet * 5
-            result_text = f"💎 **DIAMOND JACKPOT!** 💎 You won **${winnings:,}** (5x)!"
+            desc = f"💎 **DIAMOND JACKPOT!** (5x)\nYou won **${winnings:,}**!"
         else:
             winnings = bet * 3
-            result_text = f"🎉 **TRIPLE JACKPOT!** You won **${winnings:,}** (3x)!"
+            desc = f"🎉 **TRIPLE JACKPOT!** (3x)\nYou won **${winnings:,}**!"
         update_balance(ctx.author.id, winnings)
+        embed_color = discord.Color.green()
+        title_str = "🎰 Slots — JACKPOT WIN!"
     else:
         update_balance(ctx.author.id, -bet)
-        result_text = f"❌ **You lost ${bet:,}.**"
+        desc = f"❌ You lost **${bet:,}**."
+        embed_color = discord.Color.red()
+        title_str = "🎰 Slots — LOSS"
 
     new_bal = "∞ (Infinite)" if ctx.author.id in infinite_money_users else f"${get_balance(ctx.author.id):,}"
-    await msg.edit(content=f"[ {reel1} | {reel2} | {reel3} ]\n{ctx.author.mention}, {result_text} New wallet: **{new_bal}**")
+    embed = discord.Embed(
+        title=title_str,
+        description=f"[ {reel1} | {reel2} | {reel3} ]\n\n{ctx.author.mention}, {desc}\nNew wallet: **{new_bal}**",
+        color=embed_color
+    )
+    await msg.edit(content=None, embed=embed)
 
 # --- Blackjack ---
 @bot.command(name="bj", aliases=["blackjack"])
@@ -629,12 +644,26 @@ async def blackjack(ctx, bet: int):
 
     if player_score > dealer_score:
         update_balance(ctx.author.id, bet)
-        await msg.edit(content=f"🃏 You got **{player_score}**, Dealer got **{dealer_score}**. You WON **${bet:,}**! {ctx.author.mention}, wallet: **{new_bal}**")
+        embed = discord.Embed(
+            title="🃏 Blackjack — YOU WON!",
+            description=f"Your Score: **{player_score}** | Dealer Score: **{dealer_score}**\n{ctx.author.mention}, you won **${bet:,}**!\nWallet: **{new_bal}**",
+            color=discord.Color.green()
+        )
     elif player_score < dealer_score:
         update_balance(ctx.author.id, -bet)
-        await msg.edit(content=f"🃏 You got **{player_score}**, Dealer got **{dealer_score}**. You LOST **${bet:,}**. {ctx.author.mention}, wallet: **{new_bal}**")
+        embed = discord.Embed(
+            title="🃏 Blackjack — YOU LOST",
+            description=f"Your Score: **{player_score}** | Dealer Score: **{dealer_score}**\n{ctx.author.mention}, you lost **${bet:,}**.\nWallet: **{new_bal}**",
+            color=discord.Color.red()
+        )
     else:
-        await msg.edit(content=f"🃏 Push! Both got **{player_score}**. Your bet was returned.")
+        embed = discord.Embed(
+            title="🃏 Blackjack — PUSH",
+            description=f"Both got **{player_score}**. Your bet of **${bet:,}** was returned.",
+            color=discord.Color.gold()
+        )
+
+    await msg.edit(content=None, embed=embed)
 
 # --- Roulette ---
 @bot.command(name="roulette")
@@ -655,17 +684,26 @@ async def roulette(ctx, bet: int, choice: str):
     await asyncio.sleep(0.6)
 
     spin = choice if (ctx.author.id in rigged_users or ctx.author.id in infinite_money_users) else random.choices(["red", "black", "green"], weights=[47.3, 47.3, 5.4])[0]
-    
+    new_bal = "∞ (Infinite)" if ctx.author.id in infinite_money_users else f"${get_balance(ctx.author.id):,}"
+
     if choice == spin:
         multiplier = 14 if choice == "green" else 2
         winnings = bet * multiplier
         update_balance(ctx.author.id, winnings)
-        new_bal = "∞ (Infinite)" if ctx.author.id in infinite_money_users else f"${get_balance(ctx.author.id):,}"
-        await msg.edit(content=f"🎡 Wheel landed on **{spin.upper()}**! You won **${winnings:,}**! {ctx.author.mention}, wallet: **{new_bal}**")
+        embed = discord.Embed(
+            title="🎡 Roulette — WIN!",
+            description=f"Wheel landed on **{spin.upper()}**!\n{ctx.author.mention}, you won **${winnings:,}**!\nWallet: **{new_bal}**",
+            color=discord.Color.green()
+        )
     else:
         update_balance(ctx.author.id, -bet)
-        new_bal = "∞ (Infinite)" if ctx.author.id in infinite_money_users else f"${get_balance(ctx.author.id):,}"
-        await msg.edit(content=f"🎡 Wheel landed on **{spin.upper()}**! You lost **${bet:,}**. {ctx.author.mention}, wallet: **{new_bal}**")
+        embed = discord.Embed(
+            title="🎡 Roulette — LOSS",
+            description=f"Wheel landed on **{spin.upper()}**!\n{ctx.author.mention}, you lost **${bet:,}**.\nWallet: **{new_bal}**",
+            color=discord.Color.red()
+        )
+
+    await msg.edit(content=None, embed=embed)
 
 # --- Poker ---
 @bot.command(name="poker")
@@ -697,12 +735,26 @@ async def poker(ctx, bet: int):
     if rank[player_hand] > rank[dealer_hand]:
         winnings = bet * 2
         update_balance(ctx.author.id, winnings)
-        await msg.edit(content=f"♠️ You had **{player_hand}**, Dealer had **{dealer_hand}**. You won **${winnings:,}**! {ctx.author.mention}, wallet: **{new_bal}**")
+        embed = discord.Embed(
+            title="♠️ Poker — YOU WON!",
+            description=f"You: **{player_hand}** | Dealer: **{dealer_hand}**\nYou won **${winnings:,}**! {ctx.author.mention}\nWallet: **{new_bal}**",
+            color=discord.Color.green()
+        )
     elif rank[player_hand] < rank[dealer_hand]:
         update_balance(ctx.author.id, -bet)
-        await msg.edit(content=f"♠️ You had **{player_hand}**, Dealer had **{dealer_hand}**. You lost **${bet:,}**. {ctx.author.mention}, wallet: **{new_bal}**")
+        embed = discord.Embed(
+            title="♠️ Poker — YOU LOST",
+            description=f"You: **{player_hand}** | Dealer: **{dealer_hand}**\nYou lost **${bet:,}**. {ctx.author.mention}\nWallet: **{new_bal}**",
+            color=discord.Color.red()
+        )
     else:
-        await msg.edit(content=f"♠️ Split pot! Both had **{player_hand}**. Bet returned.")
+        embed = discord.Embed(
+            title="♠️ Poker — SPLIT POT",
+            description=f"Both had **{player_hand}**. Bet of **${bet:,}** returned.",
+            color=discord.Color.gold()
+        )
+
+    await msg.edit(content=None, embed=embed)
 
 # 6. Run your bot
 TOKEN = os.environ.get("DISCORD_TOKEN")
