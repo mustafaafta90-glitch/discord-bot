@@ -133,7 +133,7 @@ class EconomyHelpSelect(discord.ui.Select):
                 title="🪙 Economy Commands",
                 description=(
                     "`!balance [@user]` - Check wallet & wealth tier\n"
-                    "`!daily` - Claim daily reward ($500)\n"
+                    "`!daily` - Claim reward ($500 every 15m)\n"
                     "`!give <@user> <amount>` - Transfer money to someone\n"
                     "`!rob <@user>` - Attempt to steal money (Watch out for fines!)"
                 ),
@@ -238,11 +238,19 @@ async def bal(ctx, member: discord.Member = None):
     embed.set_footer(text="Secure SQLite Ledger")
     await ctx.send(embed=embed)
 
+# --- DAILY REWARD WITH 15-MINUTE COOLDOWN ---
 @bot.command(name="daily")
+@commands.cooldown(1, 900, commands.BucketType.user)  # 900 seconds = 15 minutes
 async def daily(ctx):
     update_balance(ctx.author.id, 500)
     new_bal = get_balance(ctx.author.id)
-    await ctx.send(f"{ctx.author.mention}, you claimed your daily reward of **$500**! Wallet: **${new_bal:,}**")
+    await ctx.send(f"{ctx.author.mention}, you claimed your reward of **$500**! Wallet: **${new_bal:,}**")
+
+@daily.error
+async def daily_error(ctx, error):
+    if isinstance(error, commands.CommandOnCooldown):
+        minutes, seconds = divmod(int(error.retry_after), 60)
+        await ctx.send(f"⏳ You are on cooldown! Try again in **{minutes}m {seconds}s**.")
 
 # --- BANKING: DEPOSIT & WITHDRAW ---
 @bot.command(name="deposit", aliases=["dep"])
