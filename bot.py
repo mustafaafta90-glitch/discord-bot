@@ -115,10 +115,10 @@ SHOP_ITEMS = {
 class EconomyHelpSelect(discord.ui.Select):
     def __init__(self):
         options = [
-            discord.SelectOption(label="Economy", description="Wallet, balance, daily rewards, & giving", emoji="🪙"),
+            discord.SelectOption(label="Economy", description="Wallet, balance, leaderboard, daily rewards, & giving", emoji="🪙"),
             discord.SelectOption(label="Casino", description="Coinflip, slots, blackjack, and roulette", emoji="🎰"),
             discord.SelectOption(label="Shop & Inventory", description="Browse defensive and booster items", emoji="🛒"),
-            discord.SelectOption(label="Bank & Loans", description="Deposits, withdrawals, and loan options", emoji="🏦"),
+            discord.SelectOption(label="Bank & Loans", description="Deposits, withdrawals, and server reset", emoji="🏦"),
         ]
         super().__init__(
             placeholder="Select a category to view commands...",
@@ -133,6 +133,7 @@ class EconomyHelpSelect(discord.ui.Select):
                 title="🪙 Economy Commands",
                 description=(
                     "`!balance [@user]` - Check wallet & wealth tier\n"
+                    "`!leaderboard` (`!lb`) - View top 10 richest players\n"
                     "`!daily` - Claim reward ($500 every 15m)\n"
                     "`!give <@user> <amount>` - Transfer money to someone\n"
                     "`!rob <@user>` - Attempt to steal money (Watch out for fines!)"
@@ -176,7 +177,7 @@ class EconomyHelpSelect(discord.ui.Select):
                 description=(
                     "`!deposit <amount/all>` (`!dep`) - Deposit cash into bank\n"
                     "`!withdraw <amount/all>` (`!with`) - Withdraw cash from bank\n"
-                    "`!reseteco` - Admin reset command"
+                    "`!reseteco` - Admin command to reset all server balances & items"
                 ),
                 color=discord.Color.from_rgb(138, 43, 226)
             )
@@ -236,6 +237,49 @@ async def bal(ctx, member: discord.Member = None):
     embed.add_field(name="🏛️ Bank Account", value=f"**{bank_str}**", inline=True)
     embed.add_field(name="🏆 Wealth Tier", value=f"**{rank_title}**", inline=False)
     embed.set_footer(text="Secure SQLite Ledger")
+    await ctx.send(embed=embed)
+
+# --- LEADERBOARD COMMAND ---
+@bot.command(name="leaderboard", aliases=["lb", "rich"])
+async def leaderboard(ctx):
+    cursor.execute("SELECT user_id, wallet, bank FROM users")
+    rows = cursor.fetchall()
+
+    if not rows:
+        return await ctx.send("❌ No economy data found yet!")
+
+    # Calculate total wealth (wallet + bank) for each user
+    user_wealth = []
+    for row in rows:
+        uid, wallet, bank = row
+        total = 999999999999999 if int(uid) in infinite_money_users else (wallet + bank)
+        user_wealth.append((uid, total))
+
+    # Sort descending by total wealth
+    user_wealth.sort(key=lambda x: x[1], reverse=True)
+
+    embed = discord.Embed(
+        title="🏆 Server Wealth Leaderboard — Top 10",
+        description="Ranking the wealthiest players by total net worth (Wallet + Bank).",
+        color=discord.Color.gold()
+    )
+
+    medals = ["🥇", "🥈", "🥉"]
+    lb_text = []
+
+    for idx, (uid, wealth) in enumerate(user_wealth[:10], start=1):
+        try:
+            member = await ctx.guild.fetch_member(int(uid))
+            name = member.display_name
+        except Exception:
+            name = f"User ID: {uid}"
+
+        wealth_str = "∞ (Infinite)" if wealth >= 999999999999999 else f"${wealth:,}"
+        prefix = medals[idx - 1] if idx <= 3 else f"`#{idx}`"
+        lb_text.append(f"{prefix} **{name}** — 💰 **{wealth_str}**")
+
+    embed.add_field(name="Richest Players", value="\n".join(lb_text), inline=False)
+    embed.set_footer(text=f"Requested by {ctx.author.display_name}", icon_url=ctx.author.display_avatar.url)
     await ctx.send(embed=embed)
 
 # --- DAILY REWARD WITH 15-MINUTE COOLDOWN ---
@@ -336,13 +380,14 @@ async def give(ctx, recipient: discord.Member, amount: int):
     new_sender_bal = "∞ (Infinite)" if ctx.author.id in infinite_money_users else f"${get_balance(ctx.author.id):,}"
     await ctx.send(f"💸 {ctx.author.mention} successfully sent **${amount:,}** to {recipient.mention}! Your new wallet balance: **{new_sender_bal}**")
 
-@bot.command(name="resetmoney", aliases=["clearbal"])
+# --- ADMIN SERVER-WIDE ECONOMY RESET ---
+@bot.command(name="reseteco", aliases=["reseteconomy"])
 @commands.has_permissions(administrator=True)
-async def resetmoney(ctx):
-    set_balance(ctx.author.id, 0)
-    cursor.execute("UPDATE users SET bank = 0 WHERE user_id = ?", (str(ctx.author.id),))
+async def reseteco(ctx):
+    cursor.execute("DELETE FROM users")
+    cursor.execute("DELETE FROM inventory")
     conn.commit()
-    await ctx.send(f"💸 {ctx.author.mention}, your wallet and bank balances have been reset to **$0**!")
+    await ctx.send(f"⚠️ {ctx.author.mention} has completely reset the server economy! All wallets, banks, and inventories have been wiped to **$0**.")
 
 # --- SHOP & INVENTORY COMMANDS ---
 @bot.command(name="shop")
@@ -514,7 +559,7 @@ async def coinflip(ctx, bet: int, choice: str):
         new_bal = "∞ (Infinite)" if ctx.author.id in infinite_money_users else f"${get_balance(ctx.author.id):,}"
         await msg.edit(content=f"🪙 It landed on **{outcome.upper()}**! You lost **${bet:,}**. {ctx.author.mention}, new wallet: **{new_bal}**")
 
-# --- Slots ---
+# --- Slots (Balanced: No 2x small wins) ---
 @bot.command(name="slots")
 async def slots(ctx, bet: int):
     current_bal = get_balance(ctx.author.id)
@@ -552,10 +597,6 @@ async def slots(ctx, bet: int):
             winnings = bet * 3
             result_text = f"🎉 **TRIPLE JACKPOT!** You won **${winnings:,}** (3x)!"
         update_balance(ctx.author.id, winnings)
-    elif reel1 == reel2 or reel2 == reel3 or reel1 == reel3:
-        winnings = bet * 2
-        update_balance(ctx.author.id, winnings)
-        result_text = f"🎉 **Small Win!** You won **${winnings:,}** (2x)!"
     else:
         update_balance(ctx.author.id, -bet)
         result_text = f"❌ **You lost ${bet:,}.**"
