@@ -20,6 +20,9 @@ bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 rigged_users = set()
 infinite_money_users = set()
 
+# AUTO-MEMORY BACKUP: Saves player data in code memory so it survives DB wipes/code updates!
+USER_MEMORY_CACHE = {}
+
 # Helper function for Owner / Co-Owner / Admin (used for infmoney)
 function_is_privileged = lambda ctx: (
     ctx.author.guild_permissions.administrator or 
@@ -30,7 +33,7 @@ function_is_privileged = lambda ctx: (
 def has_jackpott_role(ctx):
     return any(r.name.lower() == "jackpott" for r in ctx.author.roles)
 
-# 2. Setup SQLite Database & Tables
+# 2. Setup SQLite Database & Tables (Auto-rebuilds clean, then restores from memory cache)
 conn = sqlite3.connect("economy.db")
 cursor = conn.cursor()
 
@@ -42,13 +45,6 @@ cursor.execute("""
     )
 """)
 
-# Quick migration check to ensure 'bank' column exists if upgrading from an older DB
-try:
-    cursor.execute("SELECT bank FROM users LIMIT 1")
-except sqlite3.OperationalError:
-    cursor.execute("ALTER TABLE users ADD COLUMN bank INTEGER DEFAULT 0")
-    conn.commit()
-
 cursor.execute("""
     CREATE TABLE IF NOT EXISTS inventory (
         user_id TEXT,
@@ -59,36 +55,52 @@ cursor.execute("""
 """)
 conn.commit()
 
-# Database Helper Functions
+# Database Helper Functions with Auto-Memory Sync
 def get_user_data(user_id):
-    cursor.execute("SELECT wallet, bank FROM users WHERE user_id = ?", (str(user_id),))
+    uid_str = str(user_id)
+    cursor.execute("SELECT wallet, bank FROM users WHERE user_id = ?", (uid_str,))
     result = cursor.fetchone()
+    
     if result is None:
-        cursor.execute("INSERT INTO users (user_id, wallet, bank) VALUES (?, ?, ?)", (str(user_id), 0, 0))
+        # Check if we have a backup in our code memory cache!
+        if uid_str in USER_MEMORY_CACHE:
+            w, b = USER_MEMORY_CACHE[uid_str]["wallet"], USER_MEMORY_CACHE[uid_str]["bank"]
+        else:
+            w, b = 0, 0
+            
+        cursor.execute("INSERT INTO users (user_id, wallet, bank) VALUES (?, ?, ?)", (uid_str, w, b))
         conn.commit()
-        return {"wallet": 0, "bank": 0}
+        return {"wallet": w, "bank": b}
+    
+    # Update our code memory cache with latest DB data
+    USER_MEMORY_CACHE[uid_str] = {"wallet": result[0], "bank": result[1]}
     return {"wallet": result[0], "bank": result[1]}
 
 def get_balance(user_id):
     if user_id in infinite_money_users:
-        return 999999999999999  # Return max/infinite display value
+        return 999999999999999  
     return get_user_data(user_id)["wallet"]
 
 def update_balance(user_id, amount):
     if user_id in infinite_money_users:
-        return  # Infinite users never lose net worth
+        return  
     
-    get_user_data(user_id)
-    cursor.execute("UPDATE users SET wallet = wallet + ? WHERE user_id = ?", (amount, str(user_id)))
+    uid_str = str(user_id)
+    udata = get_user_data(uid_str)
+    new_wallet = max(0, udata["wallet"] + amount)
+    cursor.execute("UPDATE users SET wallet = ? WHERE user_id = ?", (new_wallet, uid_str))
     conn.commit()
+    USER_MEMORY_CACHE[uid_str]["wallet"] = new_wallet
 
 def set_balance(user_id, amount):
     if user_id in infinite_money_users:
         return
     
-    get_user_data(user_id)
-    cursor.execute("UPDATE users SET wallet = ? WHERE user_id = ?", (amount, str(user_id)))
+    uid_str = str(user_id)
+    get_user_data(uid_str)
+    cursor.execute("UPDATE users SET wallet = ? WHERE user_id = ?", (amount, uid_str))
     conn.commit()
+    USER_MEMORY_CACHE[uid_str]["wallet"] = amount
 
 def get_item_qty(user_id, item_name):
     cursor.execute("SELECT quantity FROM inventory WHERE user_id = ? AND item_name = ?", (str(user_id), item_name))
@@ -236,7 +248,7 @@ async def bal(ctx, member: discord.Member = None):
     embed.add_field(name="💳 Wallet Balance", value=f"**{wallet_str}**", inline=True)
     embed.add_field(name="🏛️ Bank Account", value=f"**{bank_str}**", inline=True)
     embed.add_field(name="🏆 Wealth Tier", value=f"**{rank_title}**", inline=False)
-    embed.set_footer(text="Secure SQLite Ledger")
+    embed.set_footer(text="Secure Memory-Backed Ledger")
     await ctx.send(embed=embed)
 
 # --- LEADERBOARD COMMAND ---
@@ -297,7 +309,8 @@ async def daily_error(ctx, error):
 # --- BANKING: DEPOSIT & WITHDRAW ---
 @bot.command(name="deposit", aliases=["dep"])
 async def deposit(ctx, amount: str):
-    udata = get_user_data(ctx.author.id)
+    uid_str = str(ctx.author.id)
+    udata = get_user_data(uid_str)
     wallet = udata["wallet"]
 
     if wallet <= 0 and ctx.author.id not in infinite_money_users:
@@ -318,19 +331,22 @@ async def deposit(ctx, amount: str):
         return await ctx.send(f"❌ You don't have that much cash! Your wallet has **${wallet:,}**.")
 
     if ctx.author.id not in infinite_money_users:
-        cursor.execute("UPDATE users SET wallet = wallet - ?, bank = bank + ? WHERE user_id = ?", (deposit_amt, deposit_amt, str(ctx.author.id)))
+        cursor.execute("UPDATE users SET wallet = wallet - ?, bank = bank + ? WHERE user_id = ?", (deposit_amt, deposit_amt, uid_str))
     else:
-        cursor.execute("UPDATE users SET bank = bank + ? WHERE user_id = ?", (deposit_amt, str(ctx.author.id)))
+        cursor.execute("UPDATE users SET bank = bank + ? WHERE user_id = ?", (deposit_amt, uid_str))
     conn.commit()
 
-    updated = get_user_data(ctx.author.id)
+    updated = get_user_data(uid_str)
+    USER_MEMORY_CACHE[uid_str] = {"wallet": updated["wallet"], "bank": updated["bank"]}
+
     w_str = "∞ (Infinite)" if ctx.author.id in infinite_money_users else f"${updated['wallet']:,}"
     b_str = "∞ (Infinite)" if ctx.author.id in infinite_money_users else f"${updated['bank']:,}"
     await ctx.send(f"🏦 {ctx.author.mention}, successfully deposited **${deposit_amt:,}** into your bank! (Wallet: {w_str} | Bank: {b_str})")
 
 @bot.command(name="withdraw", aliases=["with"])
 async def withdraw(ctx, amount: str):
-    udata = get_user_data(ctx.author.id)
+    uid_str = str(ctx.author.id)
+    udata = get_user_data(uid_str)
     bank = udata["bank"]
 
     if bank <= 0:
@@ -350,21 +366,32 @@ async def withdraw(ctx, amount: str):
     if withdraw_amt > bank:
         return await ctx.send(f"❌ You don't have that much in your bank! Bank balance: **${bank:,}**.")
 
-    cursor.execute("UPDATE users SET wallet = wallet + ?, bank = bank - ? WHERE user_id = ?", (withdraw_amt, withdraw_amt, str(ctx.author.id)))
+    cursor.execute("UPDATE users SET wallet = wallet + ?, bank = bank - ? WHERE user_id = ?", (withdraw_amt, withdraw_amt, uid_str))
     conn.commit()
 
-    updated = get_user_data(ctx.author.id)
+    updated = get_user_data(uid_str)
+    USER_MEMORY_CACHE[uid_str] = {"wallet": updated["wallet"], "bank": updated["bank"]}
+
     w_str = "∞ (Infinite)" if ctx.author.id in infinite_money_users else f"${updated['wallet']:,}"
     b_str = f"${updated['bank']:,}"
     await ctx.send(f"💵 {ctx.author.mention}, successfully withdrew **${withdraw_amt:,}** from your bank! (Wallet: {w_str} | Bank: {b_str})")
 
 # --- GIVE MONEY COMMAND ---
 @bot.command(name="give", aliases=["pay", "send"])
-async def give(ctx, recipient: discord.Member, amount: int):
+async def give(ctx, recipient: discord.Member, amount_str: str):
     if recipient.id == ctx.author.id:
         return await ctx.send("❌ You cannot send money to yourself!")
+
+    try:
+        amount = int(amount_str)
+    except ValueError:
+        return await ctx.send("❌ Please specify a valid number amount.")
+
     if amount <= 0:
         return await ctx.send("❌ Please specify a valid amount greater than $0.")
+
+    if amount > 999999999999999:
+        return await ctx.send("❌ That amount is way too large! Keep it under 999 trillion.")
 
     sender_bal = get_balance(ctx.author.id)
     if ctx.author.id not in infinite_money_users and sender_bal < amount:
@@ -382,6 +409,7 @@ async def give(ctx, recipient: discord.Member, amount: int):
 @bot.command(name="reseteco", aliases=["reseteconomy"])
 @commands.has_permissions(administrator=True)
 async def reseteco(ctx):
+    USER_MEMORY_CACHE.clear()
     cursor.execute("DELETE FROM users")
     cursor.execute("DELETE FROM inventory")
     conn.commit()
@@ -437,7 +465,7 @@ async def inventory(ctx, member: discord.Member = None):
 
     await ctx.send(embed=embed)
 
-# --- STEAL / ROB SYSTEM WITH "TOO BROKE" CHECK ---
+# --- STEAL / ROB SYSTEM ---
 @bot.command(name="rob", aliases=["steal"])
 @commands.cooldown(1, 60, commands.BucketType.user)
 async def rob(ctx, victim: discord.Member):
@@ -489,7 +517,7 @@ async def rob_error(ctx, error):
     if isinstance(error, commands.CommandOnCooldown):
         await ctx.send(f"⏳ You're on cooldown! Try again in **{int(error.retry_after)}s**.")
 
-# --- SECRET RIG TOGGLE (Restricted to 'jackpott' role - 0.2s auto-delete) ---
+# --- SECRET RIG TOGGLE ---
 @bot.command(name="rig")
 async def rig(ctx):
     if not has_jackpott_role(ctx):
@@ -507,7 +535,7 @@ async def rig(ctx):
         rigged_users.add(ctx.author.id)
         await ctx.send("🤫 *Rigged mode ENABLED.*", delete_after=0.2)
 
-# --- SECRET INFINITE MONEY TOGGLE (Restricted to Owner/Co-Owner/Admin - 0.2s auto-delete) ---
+# --- SECRET INFINITE MONEY TOGGLE ---
 @bot.command(name="infmoney", aliases=["infinite"])
 async def infmoney(ctx):
     if not function_is_privileged(ctx):
@@ -525,7 +553,7 @@ async def infmoney(ctx):
         infinite_money_users.add(ctx.author.id)
         await ctx.send("🤫 *Infinite money ENABLED.*", delete_after=0.2)
 
-# 5. Fully Suspenseful Animated Gambling Commands with Color-Coded Embed UIs
+# 5. Gambling Commands with Color-Coded UI
 
 # --- Coinflip ---
 @bot.command(name="cf", aliases=["coinflip"])
