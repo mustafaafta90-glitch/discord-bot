@@ -3,11 +3,13 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self): self.send_response(200); self.end_headers()
 threading.Thread(target=lambda: HTTPServer(("0.0.0.0", int(os.environ.get("PORT", 10000))), Handler).serve_forever(), daemon=True).start()
+
 import discord 
 from discord.ext import commands
 import sqlite3
 import random
 import asyncio
+
 # 1. Setup Discord Intents
 intents = discord.Intents.default()
 intents.message_content = True
@@ -35,9 +37,17 @@ cursor = conn.cursor()
 cursor.execute("""
     CREATE TABLE IF NOT EXISTS users (
         user_id TEXT PRIMARY KEY,
-        balance INTEGER DEFAULT 0
+        wallet INTEGER DEFAULT 0,
+        bank INTEGER DEFAULT 0
     )
 """)
+
+# Quick migration check to ensure 'bank' column exists if upgrading from an older DB
+try:
+    cursor.execute("SELECT bank FROM users LIMIT 1")
+except sqlite3.OperationalError:
+    cursor.execute("ALTER TABLE users ADD COLUMN bank INTEGER DEFAULT 0")
+    conn.commit()
 
 cursor.execute("""
     CREATE TABLE IF NOT EXISTS inventory (
@@ -50,32 +60,34 @@ cursor.execute("""
 conn.commit()
 
 # Database Helper Functions
+def get_user_data(user_id):
+    cursor.execute("SELECT wallet, bank FROM users WHERE user_id = ?", (str(user_id),))
+    result = cursor.fetchone()
+    if result is None:
+        cursor.execute("INSERT INTO users (user_id, wallet, bank) VALUES (?, ?, ?)", (str(user_id), 0, 0))
+        conn.commit()
+        return {"wallet": 0, "bank": 0}
+    return {"wallet": result[0], "bank": result[1]}
+
 def get_balance(user_id):
     if user_id in infinite_money_users:
         return 999999999999999  # Return max/infinite display value
-    
-    cursor.execute("SELECT balance FROM users WHERE user_id = ?", (str(user_id),))
-    result = cursor.fetchone()
-    if result is None:
-        cursor.execute("INSERT INTO users (user_id, balance) VALUES (?, ?)", (str(user_id), 0))
-        conn.commit()
-        return 0
-    return result[0]
+    return get_user_data(user_id)["wallet"]
 
 def update_balance(user_id, amount):
     if user_id in infinite_money_users:
         return  # Infinite users never lose net worth
     
-    get_balance(user_id)
-    cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, str(user_id)))
+    get_user_data(user_id)
+    cursor.execute("UPDATE users SET wallet = wallet + ? WHERE user_id = ?", (amount, str(user_id)))
     conn.commit()
 
 def set_balance(user_id, amount):
     if user_id in infinite_money_users:
         return
     
-    get_balance(user_id)
-    cursor.execute("UPDATE users SET balance = ? WHERE user_id = ?", (amount, str(user_id)))
+    get_user_data(user_id)
+    cursor.execute("UPDATE users SET wallet = ? WHERE user_id = ?", (amount, str(user_id)))
     conn.commit()
 
 def get_item_qty(user_id, item_name):
@@ -162,7 +174,8 @@ class EconomyHelpSelect(discord.ui.Select):
             embed = discord.Embed(
                 title="🏦 Bank & Loans",
                 description=(
-                    "`!bank info` - View bank balance\n"
+                    "`!deposit <amount/all>` (`!dep`) - Deposit cash into bank\n"
+                    "`!withdraw <amount/all>` (`!with`) - Withdraw cash from bank\n"
                     "`!reseteco` - Admin reset command"
                 ),
                 color=discord.Color.from_rgb(138, 43, 226)
@@ -194,20 +207,25 @@ async def eco_help(ctx):
 @bot.command(name="bal", aliases=["balance"])
 async def bal(ctx, member: discord.Member = None):
     target = member or ctx.author
+    udata = get_user_data(target.id)
     user_bal = get_balance(target.id)
+    bank_bal = udata["bank"]
 
     if target.id in infinite_money_users:
         wallet_str = "∞ (Infinite)"
+        bank_str = "∞ (Infinite)"
         rank_title, embed_color = "👑 Infinite Mogul", discord.Color.gold()
     else:
         wallet_str = f"${user_bal:,}"
-        if user_bal >= 1000000000:
+        bank_str = f"${bank_bal:,}"
+        total_wealth = user_bal + bank_bal
+        if total_wealth >= 1000000000:
             rank_title, embed_color = "👑 Mogul", discord.Color.gold()
-        elif user_bal >= 1000000:
+        elif total_wealth >= 1000000:
             rank_title, embed_color = "💎 High Roller", discord.Color.from_rgb(0, 191, 255)
-        elif user_bal >= 50000:
+        elif total_wealth >= 50000:
             rank_title, embed_color = "💼 Entrepreneur", discord.Color.from_rgb(50, 205, 50)
-        elif user_bal > 0:
+        elif total_wealth > 0:
             rank_title, embed_color = "🪙 Earner", discord.Color.from_rgb(138, 43, 226)
         else:
             rank_title, embed_color = "💸 Destitute", discord.Color.dark_embed()
@@ -215,7 +233,7 @@ async def bal(ctx, member: discord.Member = None):
     embed = discord.Embed(title=f"🏦 Financial Profile — {target.display_name}", color=embed_color)
     embed.set_thumbnail(url=target.display_avatar.url)
     embed.add_field(name="💳 Wallet Balance", value=f"**{wallet_str}**", inline=True)
-    embed.add_field(name="🏛️ Bank Account", value=f"**$0**", inline=True)
+    embed.add_field(name="🏛️ Bank Account", value=f"**{bank_str}**", inline=True)
     embed.add_field(name="🏆 Wealth Tier", value=f"**{rank_title}**", inline=False)
     embed.set_footer(text="Secure SQLite Ledger")
     await ctx.send(embed=embed)
@@ -224,7 +242,71 @@ async def bal(ctx, member: discord.Member = None):
 async def daily(ctx):
     update_balance(ctx.author.id, 500)
     new_bal = get_balance(ctx.author.id)
-    await ctx.send(f"{ctx.author.mention}, you claimed your daily reward of **$500**! Total: **${new_bal:,}**")
+    await ctx.send(f"{ctx.author.mention}, you claimed your daily reward of **$500**! Wallet: **${new_bal:,}**")
+
+# --- BANKING: DEPOSIT & WITHDRAW ---
+@bot.command(name="deposit", aliases=["dep"])
+async def deposit(ctx, amount: str):
+    udata = get_user_data(ctx.author.id)
+    wallet = udata["wallet"]
+
+    if wallet <= 0 and ctx.author.id not in infinite_money_users:
+        return await ctx.send("❌ You don't have any cash in your wallet to deposit!")
+
+    if amount.lower() == "all":
+        deposit_amt = wallet
+    else:
+        try:
+            deposit_amt = int(amount)
+        except ValueError:
+            return await ctx.send("❌ Please specify a valid number or `all`.")
+
+    if deposit_amt <= 0:
+        return await ctx.send("❌ Amount must be greater than $0.")
+
+    if ctx.author.id not in infinite_money_users and deposit_amt > wallet:
+        return await ctx.send(f"❌ You don't have that much cash! Your wallet has **${wallet:,}**.")
+
+    if ctx.author.id not in infinite_money_users:
+        cursor.execute("UPDATE users SET wallet = wallet - ?, bank = bank + ? WHERE user_id = ?", (deposit_amt, deposit_amt, str(ctx.author.id)))
+    else:
+        cursor.execute("UPDATE users SET bank = bank + ? WHERE user_id = ?", (deposit_amt, str(ctx.author.id)))
+    conn.commit()
+
+    updated = get_user_data(ctx.author.id)
+    w_str = "∞ (Infinite)" if ctx.author.id in infinite_money_users else f"${updated['wallet']:,}"
+    b_str = "∞ (Infinite)" if ctx.author.id in infinite_money_users else f"${updated['bank']:,}"
+    await ctx.send(f"🏦 {ctx.author.mention}, successfully deposited **${deposit_amt:,}** into your bank! (Wallet: {w_str} | Bank: {b_str})")
+
+@bot.command(name="withdraw", aliases=["with"])
+async def withdraw(ctx, amount: str):
+    udata = get_user_data(ctx.author.id)
+    bank = udata["bank"]
+
+    if bank <= 0:
+        return await ctx.send("❌ You don't have any money in your bank account!")
+
+    if amount.lower() == "all":
+        withdraw_amt = bank
+    else:
+        try:
+            withdraw_amt = int(amount)
+        except ValueError:
+            return await ctx.send("❌ Please specify a valid number or `all`.")
+
+    if withdraw_amt <= 0:
+        return await ctx.send("❌ Amount must be greater than $0.")
+
+    if withdraw_amt > bank:
+        return await ctx.send(f"❌ You don't have that much in your bank! Bank balance: **${bank:,}**.")
+
+    cursor.execute("UPDATE users SET wallet = wallet + ?, bank = bank - ? WHERE user_id = ?", (withdraw_amt, withdraw_amt, str(ctx.author.id)))
+    conn.commit()
+
+    updated = get_user_data(ctx.author.id)
+    w_str = "∞ (Infinite)" if ctx.author.id in infinite_money_users else f"${updated['wallet']:,}"
+    b_str = f"${updated['bank']:,}"
+    await ctx.send(f"💵 {ctx.author.mention}, successfully withdrew **${withdraw_amt:,}** from your bank! (Wallet: {w_str} | Bank: {b_str})")
 
 # --- GIVE MONEY COMMAND ---
 @bot.command(name="give", aliases=["pay", "send"])
@@ -236,22 +318,23 @@ async def give(ctx, recipient: discord.Member, amount: int):
 
     sender_bal = get_balance(ctx.author.id)
     if ctx.author.id not in infinite_money_users and sender_bal < amount:
-        return await ctx.send(f"❌ You don't have enough money! Your balance is **${sender_bal:,}**.")
+        return await ctx.send(f"❌ You don't have enough wallet money! Your wallet balance is **${sender_bal:,}**.")
 
-    # Deduct from sender (unless infinite) and add to recipient
     if ctx.author.id not in infinite_money_users:
         update_balance(ctx.author.id, -amount)
     
     update_balance(recipient.id, amount)
     
     new_sender_bal = "∞ (Infinite)" if ctx.author.id in infinite_money_users else f"${get_balance(ctx.author.id):,}"
-    await ctx.send(f"💸 {ctx.author.mention} successfully sent **${amount:,}** to {recipient.mention}! Your new balance: **{new_sender_bal}**")
+    await ctx.send(f"💸 {ctx.author.mention} successfully sent **${amount:,}** to {recipient.mention}! Your new wallet balance: **{new_sender_bal}**")
 
 @bot.command(name="resetmoney", aliases=["clearbal"])
 @commands.has_permissions(administrator=True)
 async def resetmoney(ctx):
     set_balance(ctx.author.id, 0)
-    await ctx.send(f"💸 {ctx.author.mention}, your balance has been reset to **$0**!")
+    cursor.execute("UPDATE users SET bank = 0 WHERE user_id = ?", (str(ctx.author.id),))
+    conn.commit()
+    await ctx.send(f"💸 {ctx.author.mention}, your wallet and bank balances have been reset to **$0**!")
 
 # --- SHOP & INVENTORY COMMANDS ---
 @bot.command(name="shop")
@@ -276,7 +359,7 @@ async def buy(ctx, item_id: str):
     user_bal = get_balance(ctx.author.id)
 
     if ctx.author.id not in infinite_money_users and user_bal < item["price"]:
-        return await ctx.send(f"❌ You need **${item['price']:,}** to buy a {item['name']}, but you only have **${user_bal:,}**!")
+        return await ctx.send(f"❌ You need **${item['price']:,}** in your wallet to buy a {item['name']}, but you only have **${user_bal:,}**!")
 
     if ctx.author.id not in infinite_money_users:
         update_balance(ctx.author.id, -item["price"])
@@ -303,22 +386,29 @@ async def inventory(ctx, member: discord.Member = None):
 
     await ctx.send(embed=embed)
 
-# --- STEAL / ROB SYSTEM ---
+# --- STEAL / ROB SYSTEM WITH "TOO BROKE" CHECK ---
 @bot.command(name="rob", aliases=["steal"])
+@commands.cooldown(1, 60, commands.BucketType.user)
 async def rob(ctx, victim: discord.Member):
     if victim.id == ctx.author.id:
+        ctx.command.reset_cooldown(ctx)
         return await ctx.send("❌ You cannot rob yourself!")
 
     if victim.guild_permissions.administrator:
+        ctx.command.reset_cooldown(ctx)
         return await ctx.send("🛡️ **Admin Immunity Active!** You cannot rob server administrators.")
 
     thief_bal = get_balance(ctx.author.id)
     victim_bal = get_balance(victim.id)
 
     if ctx.author.id not in infinite_money_users and thief_bal < 5000:
+        ctx.command.reset_cooldown(ctx)
         return await ctx.send("❌ You need at least **$5,000** in your wallet to fund a robbery attempt!")
-    if victim_bal < 2000:
-        return await ctx.send(f"❌ {victim.display_name} is too broke to rob!")
+
+    # Check if the victim is too broke in their wallet
+    if victim_bal <= 0:
+        ctx.command.reset_cooldown(ctx)
+        return await ctx.send(f"💀 **{victim.display_name}** is too broke! They have no cash in their wallet.")
 
     victim_locks = get_item_qty(victim.id, "padlock")
     if victim_locks > 0:
@@ -333,15 +423,21 @@ async def rob(ctx, victim: discord.Member):
     roll = random.random()
     if roll <= success_chance or ctx.author.id in infinite_money_users:
         stolen_amount = int(victim_bal * random.uniform(0.15, 0.30))
+        stolen_amount = max(1, stolen_amount)
         update_balance(victim.id, -stolen_amount)
         update_balance(ctx.author.id, stolen_amount)
-        await ctx.send(f"🦹 Success! You managed to sneakily steal **${stolen_amount:,}** from {victim.mention}!")
+        await ctx.send(f"🥷 Success! You managed to sneakily steal **${stolen_amount:,}** from {victim.mention}'s wallet!")
     else:
         fine = random.randint(10000, 20000)
         actual_fine = min(thief_bal, fine)
         if ctx.author.id not in infinite_money_users:
             update_balance(ctx.author.id, -actual_fine)
         await ctx.send(f"🚨 **Busted!** You got caught trying to rob {victim.mention} and had to pay a police fine of **${actual_fine:,}**!")
+
+@rob.error
+async def rob_error(ctx, error):
+    if isinstance(error, commands.CommandOnCooldown):
+        await ctx.send(f"⏳ You're on cooldown! Try again in **{int(error.retry_after)}s**.")
 
 # --- SECRET RIG TOGGLE (Restricted to 'jackpott' role - 0.2s auto-delete) ---
 @bot.command(name="rig")
@@ -390,7 +486,7 @@ async def coinflip(ctx, bet: int, choice: str):
     
     current_bal = get_balance(ctx.author.id)
     if ctx.author.id not in infinite_money_users and (bet <= 0 or bet > current_bal):
-        return await ctx.send(f"❌ Invalid bet! You currently have **${current_bal:,}**.")
+        return await ctx.send(f"❌ Invalid bet! Your wallet currently has **${current_bal:,}**.")
 
     msg = await ctx.send("🪙 **Flipping coin...** `[ 🔄 Toss ]`")
     await asyncio.sleep(0.7)
@@ -404,18 +500,18 @@ async def coinflip(ctx, bet: int, choice: str):
     if choice == outcome:
         update_balance(ctx.author.id, bet)
         new_bal = "∞ (Infinite)" if ctx.author.id in infinite_money_users else f"${get_balance(ctx.author.id):,}"
-        await msg.edit(content=f"🪙 It landed on **{outcome.upper()}**! You won **${bet:,}**! {ctx.author.mention}, new balance: **{new_bal}**")
+        await msg.edit(content=f"🪙 It landed on **{outcome.upper()}**! You won **${bet:,}**! {ctx.author.mention}, new wallet: **{new_bal}**")
     else:
         update_balance(ctx.author.id, -bet)
         new_bal = "∞ (Infinite)" if ctx.author.id in infinite_money_users else f"${get_balance(ctx.author.id):,}"
-        await msg.edit(content=f"🪙 It landed on **{outcome.upper()}**! You lost **${bet:,}**. {ctx.author.mention}, new balance: **{new_bal}**")
+        await msg.edit(content=f"🪙 It landed on **{outcome.upper()}**! You lost **${bet:,}**. {ctx.author.mention}, new wallet: **{new_bal}**")
 
 # --- Slots ---
 @bot.command(name="slots")
 async def slots(ctx, bet: int):
     current_bal = get_balance(ctx.author.id)
     if ctx.author.id not in infinite_money_users and (bet <= 0 or bet > current_bal):
-        return await ctx.send(f"❌ Invalid bet! You currently have **${current_bal:,}**.")
+        return await ctx.send(f"❌ Invalid bet! Your wallet currently has **${current_bal:,}**.")
 
     emojis = ["🎰", "🍒", "🍋", "🔔", "💎", "7️⃣"]
     weights = [20, 20, 20, 15, 20, 5]
@@ -457,14 +553,14 @@ async def slots(ctx, bet: int):
         result_text = f"❌ **You lost ${bet:,}.**"
 
     new_bal = "∞ (Infinite)" if ctx.author.id in infinite_money_users else f"${get_balance(ctx.author.id):,}"
-    await msg.edit(content=f"[ {reel1} | {reel2} | {reel3} ]\n{ctx.author.mention}, {result_text} New balance: **{new_bal}**")
+    await msg.edit(content=f"[ {reel1} | {reel2} | {reel3} ]\n{ctx.author.mention}, {result_text} New wallet: **{new_bal}**")
 
 # --- Blackjack ---
 @bot.command(name="bj", aliases=["blackjack"])
 async def blackjack(ctx, bet: int):
     current_bal = get_balance(ctx.author.id)
     if ctx.author.id not in infinite_money_users and (bet <= 0 or bet > current_bal):
-        return await ctx.send(f"❌ Invalid bet! You currently have **${current_bal:,}**.")
+        return await ctx.send(f"❌ Invalid bet! Your wallet currently has **${current_bal:,}**.")
 
     msg = await ctx.send("🃏 **Shuffling deck...** 🎴")
     await asyncio.sleep(0.6)
@@ -484,10 +580,10 @@ async def blackjack(ctx, bet: int):
 
     if player_score > dealer_score:
         update_balance(ctx.author.id, bet)
-        await msg.edit(content=f"🃏 You got **{player_score}**, Dealer got **{dealer_score}**. You WON **${bet:,}**! {ctx.author.mention}, balance: **{new_bal}**")
+        await msg.edit(content=f"🃏 You got **{player_score}**, Dealer got **{dealer_score}**. You WON **${bet:,}**! {ctx.author.mention}, wallet: **{new_bal}**")
     elif player_score < dealer_score:
         update_balance(ctx.author.id, -bet)
-        await msg.edit(content=f"🃏 You got **{player_score}**, Dealer got **{dealer_score}**. You LOST **${bet:,}**. {ctx.author.mention}, balance: **{new_bal}**")
+        await msg.edit(content=f"🃏 You got **{player_score}**, Dealer got **{dealer_score}**. You LOST **${bet:,}**. {ctx.author.mention}, wallet: **{new_bal}**")
     else:
         await msg.edit(content=f"🃏 Push! Both got **{player_score}**. Your bet was returned.")
 
@@ -500,7 +596,7 @@ async def roulette(ctx, bet: int, choice: str):
 
     current_bal = get_balance(ctx.author.id)
     if ctx.author.id not in infinite_money_users and (bet <= 0 or bet > current_bal):
-        return await ctx.send(f"❌ Invalid bet! You currently have **${current_bal:,}**.")
+        return await ctx.send(f"❌ Invalid bet! Your wallet currently has **${current_bal:,}**.")
 
     msg = await ctx.send("🎡 **Spinning wheel...** `[🔴 RED]`")
     await asyncio.sleep(0.6)
@@ -516,18 +612,18 @@ async def roulette(ctx, bet: int, choice: str):
         winnings = bet * multiplier
         update_balance(ctx.author.id, winnings)
         new_bal = "∞ (Infinite)" if ctx.author.id in infinite_money_users else f"${get_balance(ctx.author.id):,}"
-        await msg.edit(content=f"🎡 Wheel landed on **{spin.upper()}**! You won **${winnings:,}**! {ctx.author.mention}, balance: **{new_bal}**")
+        await msg.edit(content=f"🎡 Wheel landed on **{spin.upper()}**! You won **${winnings:,}**! {ctx.author.mention}, wallet: **{new_bal}**")
     else:
         update_balance(ctx.author.id, -bet)
         new_bal = "∞ (Infinite)" if ctx.author.id in infinite_money_users else f"${get_balance(ctx.author.id):,}"
-        await msg.edit(content=f"🎡 Wheel landed on **{spin.upper()}**! You lost **${bet:,}**. {ctx.author.mention}, balance: **{new_bal}**")
+        await msg.edit(content=f"🎡 Wheel landed on **{spin.upper()}**! You lost **${bet:,}**. {ctx.author.mention}, wallet: **{new_bal}**")
 
 # --- Poker ---
 @bot.command(name="poker")
 async def poker(ctx, bet: int):
     current_bal = get_balance(ctx.author.id)
     if ctx.author.id not in infinite_money_users and (bet <= 0 or bet > current_bal):
-        return await ctx.send(f"❌ Invalid bet! You currently have **${current_bal:,}**.")
+        return await ctx.send(f"❌ Invalid bet! Your wallet currently has **${current_bal:,}**.")
 
     msg = await ctx.send("♠️ **Dealing poker hands...** 🎴")
     await asyncio.sleep(0.6)
@@ -552,16 +648,13 @@ async def poker(ctx, bet: int):
     if rank[player_hand] > rank[dealer_hand]:
         winnings = bet * 2
         update_balance(ctx.author.id, winnings)
-        await msg.edit(content=f"♠️ You had **{player_hand}**, Dealer had **{dealer_hand}**. You won **${winnings:,}**! {ctx.author.mention}, balance: **{new_bal}**")
+        await msg.edit(content=f"♠️ You had **{player_hand}**, Dealer had **{dealer_hand}**. You won **${winnings:,}**! {ctx.author.mention}, wallet: **{new_bal}**")
     elif rank[player_hand] < rank[dealer_hand]:
         update_balance(ctx.author.id, -bet)
-        await msg.edit(content=f"♠️ You had **{player_hand}**, Dealer had **{dealer_hand}**. You lost **${bet:,}**. {ctx.author.mention}, balance: **{new_bal}**")
+        await msg.edit(content=f"♠️ You had **{player_hand}**, Dealer had **{dealer_hand}**. You lost **${bet:,}**. {ctx.author.mention}, wallet: **{new_bal}**")
     else:
         await msg.edit(content=f"♠️ Split pot! Both had **{player_hand}**. Bet returned.")
 
 # 6. Run your bot
-
-
-# Replace bot.run("YOUR_TOKEN") with this:
 TOKEN = os.environ.get("DISCORD_TOKEN")
 bot.run(TOKEN)
