@@ -125,13 +125,21 @@ def add_item_qty(user_id, item_name, qty):
         cursor.execute("UPDATE inventory SET quantity = ? WHERE user_id = ? AND item_name = ?", (new_qty, str(user_id), item_name))
     conn.commit()
 
+# Helper for consumable Lucky Dice logic
+def consume_lucky_dice_boost(user_id):
+    qty = get_item_qty(user_id, "lucky_dice")
+    if qty > 0:
+        add_item_qty(user_id, "lucky_dice", -1)
+        return 0.15 # 15% luck boost
+    return 0.0
+
 # Shop Catalog Items
 SHOP_ITEMS = {
     "padlock": {"name": "Padlock", "price": 15000, "desc": "Protects your wallet from being stolen by other players.", "emoji": "🔒"},
     "camera": {"name": "Security Camera", "price": 35000, "desc": "Grants a +40% luck boost during robberies.", "emoji": "📷"},
     "cooldown_drink": {"name": "Energy Drink", "price": 10000, "desc": "Cuts your action cooldown timers down by 30%.", "emoji": "⚡"},
     "lottery_ticket": {"name": "Lottery Ticket", "price": 5000, "desc": "1% chance to win the $7,000,000 jackpot via !scratch!", "emoji": "🎟️"},
-    "lucky_dice": {"name": "Lucky Dice", "price": 5000, "desc": "Increases your casino win-rate luck by +15%.", "emoji": "🎲"}
+    "lucky_dice": {"name": "Lucky Dice", "price": 5000, "desc": "Consumable: Gives +15% win rate boost on your next gamble.", "emoji": "🎲"}
 }
 
 # Background Task: Hourly Bank Interest (1% hourly passive income)
@@ -152,8 +160,8 @@ class EconomyHelpSelect(discord.ui.Select):
     def __init__(self):
         options = [
             discord.SelectOption(label="Economy", description="Wallet, balance, work, crime, leaderboard, & giving", emoji="🪙"),
-            discord.SelectOption(label="Casino", description="Coinflip, slots, blackjack, roulette, and poker", emoji="🎰"),
-            discord.SelectOption(label="Shop & Inventory", description="Browse items, 1% lottery ticket, & boosters", emoji="🛒"),
+            discord.SelectOption(label="Casino", description="High suspense games (3% slots win rate, 1000x jackpot)", emoji="🎰"),
+            discord.SelectOption(label="Shop & Inventory", description="Browse items, auto-buy lottery, & boosters", emoji="🛒"),
             discord.SelectOption(label="Bank & Bounties", description="Deposits, bank interest, and revenge bounties", emoji="🏦"),
         ]
         super().__init__(
@@ -183,13 +191,13 @@ class EconomyHelpSelect(discord.ui.Select):
 
         elif self.values[0] == "Casino":
             embed = discord.Embed(
-                title="🎰 Casino Commands",
+                title="🎰 Casino Commands (High Suspense)",
                 description=(
-                    "`!cf <bet> <heads/tails>` - Coinflip 50/50\n"
-                    "`!slots <bet>` - Slot machine (💎 5x, 777 10x)\n"
-                    "`!bj <bet>` - Blackjack vs dealer\n"
-                    "`!roulette <bet> <red/black/green>` - Roulette wheel\n"
-                    "`!poker <bet>` - Quick poker hand"
+                    "`!cf <bet> <heads/tails>` - Coinflip 50/50 with animated toss\n"
+                    "`!slots <bet>` - Slot machine (3% win rate, 777 pays 1000x!)\n"
+                    "`!bj <bet>` - Blackjack vs dealer with card dealing\n"
+                    "`!roulette <bet> <red/black/green>` - Spinning wheel roulette\n"
+                    "`!poker <bet>` - Quick poker hand with river showdown"
                 ),
                 color=discord.Color.from_rgb(138, 43, 226)
             )
@@ -202,7 +210,7 @@ class EconomyHelpSelect(discord.ui.Select):
                 description=(
                     "`!shop` - View items for sale\n"
                     "`!buy <item_id>` - Purchase gear or lottery tickets\n"
-                    "`!scratch` - Scratch a ticket (1% chance for $7M!)\n"
+                    "`!scratch` - Auto-buys ticket if needed & scratches for $7M!\n"
                     "`!inventory` - View your items and gear"
                 ),
                 color=discord.Color.from_rgb(138, 43, 226)
@@ -392,7 +400,7 @@ async def crime_error(ctx, error):
         mins, secs = divmod(int(error.retry_after), 60)
         await ctx.send(f"⏳ The police are still looking for you! Lay low for **{mins}m {secs}s**.")
 
-# --- BOUNTY SYSTEM (Restricted: Can only bounty someone if they stole from you!) ---
+# --- BOUNTY SYSTEM ---
 @bot.command(name="bounty")
 async def bounty(ctx, target: discord.Member, amount: int):
     if target.id == ctx.author.id:
@@ -400,7 +408,6 @@ async def bounty(ctx, target: discord.Member, amount: int):
     if amount <= 0:
         return await ctx.send("❌ Bounty amount must be greater than $0.")
 
-    # Check if target actually robbed this user successfully before
     user_thief_records = ROBBERY_VICTIMS.get(ctx.author.id, set())
     if target.id not in user_thief_records and ctx.author.id not in infinite_money_users:
         return await ctx.send(f"❌ You can only place a bounty on **{target.display_name}** if they have successfully robbed/stolen from you!")
@@ -416,7 +423,7 @@ async def bounty(ctx, target: discord.Member, amount: int):
                    (str(target.id), str(ctx.author.id), amount))
     conn.commit()
 
-    await ctx.send(f"🎯 {ctx.author.mention} placed a revenge bounty of **${amount:,}** on {target.id} for stealing from them!")
+    await ctx.send(f"🎯 {ctx.author.mention} placed a revenge bounty of **${amount:,}** on {target.display_name} for stealing from them!")
 
 @bot.command(name="bounties", aliases=["bountylist"])
 async def bounties(ctx):
@@ -615,38 +622,54 @@ async def inventory(ctx, member: discord.Member = None):
 
     await ctx.send(embed=embed)
 
-# --- SCRATCH CARD: EXACTLY 1% CHANCE TO WIN $7,000,000 ---
+# --- SCRATCH CARD: AUTO-BUY TICKET + 1% $7M JACKPOT ---
 @bot.command(name="scratch", aliases=["lottery"])
 async def scratch(ctx):
     tickets = get_item_qty(ctx.author.id, "lottery_ticket")
-    if tickets <= 0:
-        return await ctx.send("❌ You don't have any Lottery Tickets! Buy one from the shop using `!buy lottery_ticket`.")
+    auto_bought = False
 
-    add_item_qty(ctx.author.id, "lottery_ticket", -1)
-    
-    # Exactly 1% chance (0.01) for the $7,000,000 jackpot!
+    if tickets <= 0:
+        ticket_price = SHOP_ITEMS["lottery_ticket"]["price"]
+        user_bal = get_balance(ctx.author.id)
+
+        if ctx.author.id not in infinite_money_users and user_bal < ticket_price:
+            return await ctx.send(f"❌ You don't have a Lottery Ticket and can't afford one! Ticket price: **${ticket_price:,}** (Wallet: **${user_bal:,}**).")
+
+        if ctx.author.id not in infinite_money_users:
+            update_balance(ctx.author.id, -ticket_price)
+        
+        auto_bought = True
+    else:
+        add_item_qty(ctx.author.id, "lottery_ticket", -1)
+
+    msg = await ctx.send("🎟️ **Scratching ticket...** `[ 🪙 Rubbing silver foil... ]`")
+    await asyncio.sleep(0.8)
+    await msg.edit(content="🎟️ **Scratching ticket...** `[ 🔍 Revealing numbers... ]`")
+    await asyncio.sleep(0.8)
+
     roll = random.random()
-    if roll <= 0.01:
+    if roll <= 0.01: # 1% Chance
         prize = 7000000
-        msg = f"🎟️ **JACKPOT! YOU HIT THE 1% CHANCE!** You won **${prize:,}**!"
+        desc = f"🎟️ **JACKPOT! YOU HIT THE 1% CHANCE!**\n{ctx.author.mention}, you won **${prize:,}**!"
         color = discord.Color.gold()
     else:
         prize = 0
-        msg = "🎟️ **No luck!** Your scratch ticket was a loser. Try again!"
+        desc = f"🎟️ **No luck!** Your scratch ticket was a loser. Better luck next time, {ctx.author.mention}!"
         color = discord.Color.red()
 
     if prize > 0:
         update_balance(ctx.author.id, prize)
 
+    auto_text = " *(Auto-purchased ticket for $5,000)*" if auto_bought else ""
     new_bal = "∞ (Infinite)" if ctx.author.id in infinite_money_users else f"${get_balance(ctx.author.id):,}"
     embed = discord.Embed(
-        title="🎟️ Lottery Scratch Card",
-        description=f"{msg}\nNew wallet: **{new_bal}**",
+        title="🎟️ Lottery Scratch Card Result",
+        description=f"{desc}{auto_text}\nNew wallet: **{new_bal}**",
         color=color
     )
-    await ctx.send(embed=embed)
+    await msg.edit(content=None, embed=embed)
 
-# --- STEAL / ROB SYSTEM (Records who stole from whom for bounties) ---
+# --- STEAL / ROB SYSTEM ---
 @bot.command(name="rob", aliases=["steal"])
 @commands.cooldown(1, 60, commands.BucketType.user)
 async def rob(ctx, victim: discord.Member):
@@ -686,12 +709,10 @@ async def rob(ctx, victim: discord.Member):
         update_balance(victim.id, -stolen_amount)
         update_balance(ctx.author.id, stolen_amount)
         
-        # RECORD THAT THIS THIEF STOLE FROM THIS VICTIM (Enables revenge bounty!)
         if victim.id not in ROBBERY_VICTIMS:
             ROBBERY_VICTIMS[victim.id] = set()
         ROBBERY_VICTIMS[victim.id].add(ctx.author.id)
 
-        # Check if victim had an active bounty on this thief!
         cursor.execute("SELECT amount FROM bounties WHERE target_id = ?", (str(ctx.author.id),))
         b_res = cursor.fetchone()
         bounty_bonus = 0
@@ -748,9 +769,7 @@ async def infmoney(ctx):
         infinite_money_users.add(ctx.author.id)
         await ctx.send("🤫 *Infinite money ENABLED.*", delete_after=0.2)
 
-# 5. Gambling Commands with Lucky Dice Support
-def get_luck_boost(user_id):
-    return 0.15 if get_item_qty(user_id, "lucky_dice") > 0 else 0.0
+# 5. Gambling Games with Suspense Animations & Lucky Dice Support
 
 # --- Coinflip ---
 @bot.command(name="cf", aliases=["coinflip"])
@@ -763,18 +782,20 @@ async def coinflip(ctx, bet: int, choice: str):
     if ctx.author.id not in infinite_money_users and (bet <= 0 or bet > current_bal):
         return await ctx.send(f"❌ Invalid bet! Your wallet currently has **${current_bal:,}**.")
 
-    msg = await ctx.send("🪙 **Flipping coin...** `[ 🔄 Toss ]`")
-    await asyncio.sleep(0.7)
-    await msg.edit(content="🪙 **Flipping coin...** `[ 🌀 Spinning in the air... ]`")
-    await asyncio.sleep(0.7)
-    await msg.edit(content="🪙 **Flipping coin...** `[ 🔍 Almost landing... ]`")
-    await asyncio.sleep(0.7)
+    msg = await ctx.send("🪙 **Coinflip Arena**\n`[ 🔄 Toss in progress... ]`")
+    await asyncio.sleep(0.6)
+    await msg.edit(content="🪙 **Coinflip Arena**\n`[ 🌀 Flipping high in the air... ]`")
+    await asyncio.sleep(0.6)
+    await msg.edit(content="🪙 **Coinflip Arena**\n`[ 🔍 The coin is about to land... ]`")
+    await asyncio.sleep(0.6)
+
+    luck_boost = consume_lucky_dice_boost(ctx.author.id)
+    dice_text = "\n🎲 *(Lucky Dice consumed: +15% Luck)*" if luck_boost > 0 else ""
 
     if ctx.author.id in rigged_users:
         outcome = choice
     else:
-        boost = get_luck_boost(ctx.author.id)
-        if boost > 0 and random.random() <= boost:
+        if luck_boost > 0 and random.random() <= luck_boost:
             outcome = choice 
         else:
             outcome = random.choice(["heads", "tails"])
@@ -788,20 +809,20 @@ async def coinflip(ctx, bet: int, choice: str):
         update_balance(ctx.author.id, bet)
         embed = discord.Embed(
             title="🪙 Coinflip — VICTORY!",
-            description=f"It landed on **{outcome.upper()}**!\n{ctx.author.mention}, you won **${bet:,}**!\nNew wallet: **{new_bal}**",
+            description=f"The coin landed on **{outcome.upper()}**!\n\n🎉 {ctx.author.mention}, you won **${bet:,}**!{dice_text}\nNew wallet: **{new_bal}**",
             color=discord.Color.green()
         )
     else:
         update_balance(ctx.author.id, -bet)
         embed = discord.Embed(
             title="🪙 Coinflip — DEFEAT",
-            description=f"It landed on **{outcome.upper()}**!\n{ctx.author.mention}, you lost **${bet:,}**.\nNew wallet: **{new_bal}**",
+            description=f"The coin landed on **{outcome.upper()}**!\n\n💀 {ctx.author.mention}, you lost **${bet:,}**.{dice_text}\nNew wallet: **{new_bal}**",
             color=discord.Color.red()
         )
 
     await msg.edit(content=None, embed=embed)
 
-# --- Slots ---
+# --- Slots (3% Win Rate, Triple 7s Pays 1,000x) ---
 @bot.command(name="slots")
 async def slots(ctx, bet: int):
     current_bal = get_balance(ctx.author.id)
@@ -809,50 +830,56 @@ async def slots(ctx, bet: int):
         return await ctx.send(f"❌ Invalid bet! Your wallet currently has **${current_bal:,}**.")
 
     emojis = ["🎰", "🍒", "🍋", "🔔", "💎", "7️⃣"]
-    weights = [20, 20, 20, 15, 20, 5]
 
-    msg = await ctx.send("🎰 **Spinning the reels...** 🎰\n[ ❓ | ❓ | ❓ ]")
+    msg = await ctx.send("🎰 **Casino Slot Machine**\n`[ ❓ | ❓ | ❓ ]` — *Spinning 1st reel...*")
     await asyncio.sleep(0.7)
+
+    luck_boost = consume_lucky_dice_boost(ctx.author.id)
+    dice_text = "\n🎲 *(Lucky Dice consumed: +15% Luck)*" if luck_boost > 0 else ""
+
+    # 3% base win chance (+15% if lucky dice used)
+    win_threshold = 0.03 + luck_boost
 
     if ctx.author.id in rigged_users:
-        chosen_win = random.choice(["7️⃣", "💎"])
-        reel1, reel2, reel3 = chosen_win, chosen_win, chosen_win
+        reel1, reel2, reel3 = "7️⃣", "7️⃣", "7️⃣"
+    elif random.random() <= win_threshold:
+        win_symbol = random.choices(["🍒", "🍋", "🔔", "💎", "7️⃣"], weights=[40, 30, 20, 9, 1])[0]
+        reel1, reel2, reel3 = win_symbol, win_symbol, win_symbol
     else:
-        reel1 = random.choices(emojis, weights=weights)[0]
-        reel2 = random.choices(emojis, weights=weights)[0]
-        reel3 = random.choices(emojis, weights=weights)[0]
-        if get_luck_boost(ctx.author.id) > 0 and random.random() <= 0.15:
-            reel2 = reel1
-            reel3 = reel1
+        reel1 = random.choice(emojis)
+        reel2 = random.choice(emojis)
+        reel3 = random.choice(emojis)
+        if reel1 == reel2 == reel3:
+            reel3 = "🍒" if reel1 != "🍒" else "🍋"
 
-    await msg.edit(content=f"🎰 **Spinning the reels...** 🎰\n[ {reel1} | ❓ | ❓ ]")
+    await msg.edit(content=f"🎰 **Casino Slot Machine**\n`[ {reel1} | ❓ | ❓ ]` — *Spinning 2nd reel...*")
     await asyncio.sleep(0.7)
-    await msg.edit(content=f"🎰 **Spinning the reels...** 🎰\n[ {reel1} | {reel2} | ❓ ]")
+    await msg.edit(content=f"🎰 **Casino Slot Machine**\n`[ {reel1} | {reel2} | ❓ ]` — *Spinning final reel...*")
     await asyncio.sleep(0.7)
 
     if reel1 == reel2 == reel3:
         if reel1 == "7️⃣":
-            winnings = bet * 10
-            desc = f"🚨 **TRIPLE 7s JACKPOT!** (10x)\nYou won **${winnings:,}**!"
+            winnings = bet * 1000 # 1000x MEGA JACKPOT
+            desc = f"🚨 **TRIPLE 7s MEGA JACKPOT!** (1000x)\n🎉 {ctx.author.mention}, you won an unbelievable **${winnings:,}**!"
         elif reel1 == "💎":
-            winnings = bet * 5
-            desc = f"💎 **DIAMOND JACKPOT!** (5x)\nYou won **${winnings:,}**!"
+            winnings = bet * 25
+            desc = f"💎 **DIAMOND JACKPOT!** (25x)\n🎉 {ctx.author.mention}, you won **${winnings:,}**!"
         else:
-            winnings = bet * 3
-            desc = f"🎉 **TRIPLE JACKPOT!** (3x)\nYou won **${winnings:,}**!"
+            winnings = bet * 10
+            desc = f"🎉 **TRIPLE JACKPOT!** (10x)\n🎉 {ctx.author.mention}, you won **${winnings:,}**!"
         update_balance(ctx.author.id, winnings)
         embed_color = discord.Color.green()
         title_str = "🎰 Slots — JACKPOT WIN!"
     else:
         update_balance(ctx.author.id, -bet)
-        desc = f"❌ You lost **${bet:,}**."
+        desc = f"❌ {ctx.author.mention}, you lost **${bet:,}**."
         embed_color = discord.Color.red()
         title_str = "🎰 Slots — LOSS"
 
     new_bal = "∞ (Infinite)" if ctx.author.id in infinite_money_users else f"${get_balance(ctx.author.id):,}"
     embed = discord.Embed(
         title=title_str,
-        description=f"[ {reel1} | {reel2} | {reel3} ]\n\n{ctx.author.mention}, {desc}\nNew wallet: **{new_bal}**",
+        description=f"**[ {reel1} | {reel2} | {reel3} ]**\n\n{desc}{dice_text}\nNew wallet: **{new_bal}**",
         color=embed_color
     )
     await msg.edit(content=None, embed=embed)
@@ -864,12 +891,15 @@ async def blackjack(ctx, bet: int):
     if ctx.author.id not in infinite_money_users and (bet <= 0 or bet > current_bal):
         return await ctx.send(f"❌ Invalid bet! Your wallet currently has **${current_bal:,}**.")
 
-    msg = await ctx.send("🃏 **Shuffling deck...** 🎴")
+    msg = await ctx.send("🃏 **Blackjack Table**\n`[ 🎴 Shuffling deck... ]`")
     await asyncio.sleep(0.6)
-    await msg.edit(content="🃏 **Dealing cards to players...** 🎴")
+    await msg.edit(content="🃏 **Blackjack Table**\n`[ 🎴 Dealing cards to players... ]`")
     await asyncio.sleep(0.6)
-    await msg.edit(content="🃏 **Dealer showing house card...** 🎴")
+    await msg.edit(content="🃏 **Blackjack Table**\n`[ 🏛️ Dealer revealing house hand... ]`")
     await asyncio.sleep(0.6)
+
+    luck_boost = consume_lucky_dice_boost(ctx.author.id)
+    dice_text = "\n🎲 *(Lucky Dice consumed: +15% Luck)*" if luck_boost > 0 else ""
 
     if ctx.author.id in rigged_users:
         player_score = 21
@@ -877,7 +907,7 @@ async def blackjack(ctx, bet: int):
     else:
         player_score = random.randint(15, 21)
         dealer_score = random.randint(15, 21)
-        if get_luck_boost(ctx.author.id) > 0:
+        if luck_boost > 0 and random.random() <= luck_boost:
             player_score = 21
 
     new_bal = "∞ (Infinite)" if ctx.author.id in infinite_money_users else f"${get_balance(ctx.author.id):,}"
@@ -886,20 +916,20 @@ async def blackjack(ctx, bet: int):
         update_balance(ctx.author.id, bet)
         embed = discord.Embed(
             title="🃏 Blackjack — YOU WON!",
-            description=f"Your Score: **{player_score}** | Dealer Score: **{dealer_score}**\n{ctx.author.mention}, you won **${bet:,}**!\nWallet: **{new_bal}**",
+            description=f"Your Score: **{player_score}** | Dealer Score: **{dealer_score}**\n\n🎉 {ctx.author.mention}, you won **${bet:,}**!{dice_text}\nWallet: **{new_bal}**",
             color=discord.Color.green()
         )
     elif player_score < dealer_score:
         update_balance(ctx.author.id, -bet)
         embed = discord.Embed(
             title="🃏 Blackjack — YOU LOST",
-            description=f"Your Score: **{player_score}** | Dealer Score: **{dealer_score}**\n{ctx.author.mention}, you lost **${bet:,}**.\nWallet: **{new_bal}**",
+            description=f"Your Score: **{player_score}** | Dealer Score: **{dealer_score}**\n\n💀 {ctx.author.mention}, you lost **${bet:,}**.{dice_text}\nWallet: **{new_bal}**",
             color=discord.Color.red()
         )
     else:
         embed = discord.Embed(
-            title="🃏 Blackjack — PUSH",
-            description=f"Both got **{player_score}**. Your bet of **${bet:,}** was returned.",
+            title="🃏 Blackjack — PUSH (TIE)",
+            description=f"Both got **{player_score}**. Your bet of **${bet:,}** was returned.{dice_text}",
             color=discord.Color.gold()
         )
 
@@ -916,19 +946,23 @@ async def roulette(ctx, bet: int, choice: str):
     if ctx.author.id not in infinite_money_users and (bet <= 0 or bet > current_bal):
         return await ctx.send(f"❌ Invalid bet! Your wallet currently has **${current_bal:,}**.")
 
-    msg = await ctx.send("🎡 **Spinning wheel...** `[🔴 RED]`")
+    msg = await ctx.send("🎡 **Roulette Wheel**\n`[ 🔴 Spinning wheel... ]`")
     await asyncio.sleep(0.6)
-    await msg.edit(content="🎡 **Wheel spinning faster...** `[⚫ BLACK]`")
+    await msg.edit(content="🎡 **Roulette Wheel**\n`[ ⚫ Ball speeding across slots... ]`")
     await asyncio.sleep(0.6)
-    await msg.edit(content="🎡 **Ball bouncing around...** `[🟢 GREEN]`")
+    await msg.edit(content="🎡 **Roulette Wheel**\n`[ 🟢 Ball slowing down... ]`")
     await asyncio.sleep(0.6)
+
+    luck_boost = consume_lucky_dice_boost(ctx.author.id)
+    dice_text = "\n🎲 *(Lucky Dice consumed: +15% Luck)*" if luck_boost > 0 else ""
 
     if ctx.author.id in rigged_users:
         spin = choice
     else:
-        spin = random.choices(["red", "black", "green"], weights=[47.3, 47.3, 5.4])[0]
-        if get_luck_boost(ctx.author.id) > 0 and random.random() <= 0.15:
+        if luck_boost > 0 and random.random() <= luck_boost:
             spin = choice
+        else:
+            spin = random.choices(["red", "black", "green"], weights=[47.3, 47.3, 5.4])[0]
 
     new_bal = "∞ (Infinite)" if ctx.author.id in infinite_money_users else f"${get_balance(ctx.author.id):,}"
 
@@ -938,14 +972,14 @@ async def roulette(ctx, bet: int, choice: str):
         update_balance(ctx.author.id, winnings)
         embed = discord.Embed(
             title="🎡 Roulette — WIN!",
-            description=f"Wheel landed on **{spin.upper()}**!\n{ctx.author.mention}, you won **${winnings:,}**!\nWallet: **{new_bal}**",
+            description=f"The ball landed on **{spin.upper()}**!\n\n🎉 {ctx.author.mention}, you won **${winnings:,}**!{dice_text}\nWallet: **{new_bal}**",
             color=discord.Color.green()
         )
     else:
         update_balance(ctx.author.id, -bet)
         embed = discord.Embed(
             title="🎡 Roulette — LOSS",
-            description=f"Wheel landed on **{spin.upper()}**!\n{ctx.author.mention}, you lost **${bet:,}**.\nWallet: **{new_bal}**",
+            description=f"The ball landed on **{spin.upper()}**!\n\n💀 {ctx.author.mention}, you lost **${bet:,}**.{dice_text}\nWallet: **{new_bal}**",
             color=discord.Color.red()
         )
 
@@ -958,12 +992,15 @@ async def poker(ctx, bet: int):
     if ctx.author.id not in infinite_money_users and (bet <= 0 or bet > current_bal):
         return await ctx.send(f"❌ Invalid bet! Your wallet currently has **${current_bal:,}**.")
 
-    msg = await ctx.send("♠️ **Dealing poker hands...** 🎴")
+    msg = await ctx.send("♠️ **Poker Table**\n`[ 🎴 Dealing pocket cards... ]`")
     await asyncio.sleep(0.6)
-    await msg.edit(content="♠️ **Revealing the flop and turn...** 🃏")
+    await msg.edit(content="♠️ **Poker Table**\n`[ 🃏 Revealing the flop and turn... ]`")
     await asyncio.sleep(0.6)
-    await msg.edit(content="♠️ **Final river card dealt...** 🃏")
+    await msg.edit(content="♠️ **Poker Table**\n`[ 🃏 Dealing the final river card... ]`")
     await asyncio.sleep(0.6)
+
+    luck_boost = consume_lucky_dice_boost(ctx.author.id)
+    dice_text = "\n🎲 *(Lucky Dice consumed: +15% Luck)*" if luck_boost > 0 else ""
 
     hands = ["High Card", "Pair", "Two Pair", "Three of a Kind", "Straight", "Flush", "Full House"]
     weights = [35, 30, 15, 10, 5, 3, 2]
@@ -974,7 +1011,7 @@ async def poker(ctx, bet: int):
     else:
         player_hand = random.choices(hands, weights=weights)[0]
         dealer_hand = random.choices(hands, weights=weights)[0]
-        if get_luck_boost(ctx.author.id) > 0:
+        if luck_boost > 0 and random.random() <= luck_boost:
             player_hand = "Full House"
     
     rank = {h: i for i, h in enumerate(hands)}
@@ -985,20 +1022,20 @@ async def poker(ctx, bet: int):
         update_balance(ctx.author.id, winnings)
         embed = discord.Embed(
             title="♠️ Poker — YOU WON!",
-            description=f"You: **{player_hand}** | Dealer: **{dealer_hand}**\nYou won **${winnings:,}**! {ctx.author.mention}\nWallet: **{new_bal}**",
+            description=f"Your Hand: **{player_hand}** | Dealer: **{dealer_hand}**\n\n🎉 {ctx.author.mention}, you won **${winnings:,}**!{dice_text}\nWallet: **{new_bal}**",
             color=discord.Color.green()
         )
     elif rank[player_hand] < rank[dealer_hand]:
         update_balance(ctx.author.id, -bet)
         embed = discord.Embed(
             title="♠️ Poker — YOU LOST",
-            description=f"You: **{player_hand}** | Dealer: **{dealer_hand}**\nYou lost **${bet:,}**. {ctx.author.mention}\nWallet: **{new_bal}**",
+            description=f"Your Hand: **{player_hand}** | Dealer: **{dealer_hand}**\n\n💀 {ctx.author.mention}, you lost **${bet:,}**.{dice_text}\nWallet: **{new_bal}**",
             color=discord.Color.red()
         )
     else:
         embed = discord.Embed(
             title="♠️ Poker — SPLIT POT",
-            description=f"Both had **{player_hand}**. Bet of **${bet:,}** returned.",
+            description=f"Both had **{player_hand}**. Bet of **${bet:,}** returned.{dice_text}",
             color=discord.Color.gold()
         )
 
