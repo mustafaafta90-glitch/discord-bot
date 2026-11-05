@@ -194,7 +194,7 @@ class EconomyHelpSelect(discord.ui.Select):
                 title="🎰 Casino Commands (High Suspense)",
                 description=(
                     "`!cf <bet> <heads/tails>` - Coinflip 50/50 with animated toss\n"
-                    "`!slots <bet>` - Slot machine (3% win rate, 777 pays 1000x!)\n"
+                    "`!slots <bet>` - Slot machine (3% win rate, 777 pays 1000x, 2 match pays 3x)\n"
                     "`!bj <bet>` - Blackjack vs dealer with card dealing\n"
                     "`!roulette <bet> <red/black/green>` - Spinning wheel roulette\n"
                     "`!poker <bet>` - Quick poker hand with river showdown"
@@ -822,7 +822,7 @@ async def coinflip(ctx, bet: int, choice: str):
 
     await msg.edit(content=None, embed=embed)
 
-# --- Slots (3% Win Rate, Triple 7s Pays 1,000x) ---
+# --- Slots (3% Win Rate, 1,000x 777 Jackpot, 2 Matching Emojis = 3x Win) ---
 @bot.command(name="slots")
 async def slots(ctx, bet: int):
     current_bal = get_balance(ctx.author.id)
@@ -846,11 +846,24 @@ async def slots(ctx, bet: int):
         win_symbol = random.choices(["🍒", "🍋", "🔔", "💎", "7️⃣"], weights=[40, 30, 20, 9, 1])[0]
         reel1, reel2, reel3 = win_symbol, win_symbol, win_symbol
     else:
+        # Normal spin
         reel1 = random.choice(emojis)
         reel2 = random.choice(emojis)
         reel3 = random.choice(emojis)
-        if reel1 == reel2 == reel3:
-            reel3 = "🍒" if reel1 != "🍒" else "🍋"
+        
+        # Chance for a small win (2 matching emojis -> 3x win)
+        if random.random() <= 0.15:
+            match_sym = random.choice(emojis)
+            reels_pos = random.sample([1, 2, 3], 2)
+            if 1 in reels_pos and 2 in reels_pos:
+                reel1, reel2 = match_sym, match_sym
+                reel3 = "🍒" if match_sym != "🍒" else "🍋"
+            elif 2 in reels_pos and 3 in reels_pos:
+                reel2, reel3 = match_sym, match_sym
+                reel1 = "🍒" if match_sym != "🍒" else "🍋"
+            elif 1 in reels_pos and 3 in reels_pos:
+                reel1, reel3 = match_sym, match_sym
+                reel2 = "🍒" if match_sym != "🍒" else "🍋"
 
     await msg.edit(content=f"🎰 **Casino Slot Machine**\n`[ {reel1} | ❓ | ❓ ]` — *Spinning 2nd reel...*")
     await asyncio.sleep(0.7)
@@ -870,6 +883,13 @@ async def slots(ctx, bet: int):
         update_balance(ctx.author.id, winnings)
         embed_color = discord.Color.green()
         title_str = "🎰 Slots — JACKPOT WIN!"
+    elif reel1 == reel2 or reel2 == reel3 or reel1 == reel3:
+        # Small Win: 2 matching emojis gives 3x your money
+        winnings = bet * 3
+        update_balance(ctx.author.id, winnings)
+        desc = f"✨ **Small Win! (2 Matching Emojis)** (3x)\n🎉 {ctx.author.mention}, you won **${winnings:,}**!"
+        embed_color = discord.Color.gold()
+        title_str = "🎰 Slots — SMALL WIN"
     else:
         update_balance(ctx.author.id, -bet)
         desc = f"❌ {ctx.author.mention}, you lost **${bet:,}**."
