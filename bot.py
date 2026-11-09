@@ -198,7 +198,7 @@ async def bank_interest():
             cursor.execute("UPDATE users SET bank = bank + ? WHERE user_id = ?", (interest, uid))
     conn.commit()
 
-# 3. Dropdown Menu UI Classes (Upgraded with Rocket Pass & RL Commands)
+# 3. Dropdown Menu UI Classes
 class EconomyHelpSelect(discord.ui.Select):
     def __init__(self):
         options = [
@@ -310,7 +310,6 @@ async def on_message(message):
     if message.author.bot:
         return
     
-    # Give XP for chatting in the server (10 XP per message)
     leveled_up, new_lvl = add_user_xp(message.author.id, 10)
     if leveled_up:
         await message.channel.send(f"🎉 {message.author.mention}, your **Rocket Pass** leveled up to **Tier {new_lvl}**! You unlocked **$5,000** and a free **Champion Crate Key** (`crate_key`)! 🔑")
@@ -415,7 +414,7 @@ async def work(ctx):
     ]
     job_name, pay = random.choice(jobs)
     update_balance(ctx.author.id, pay)
-    add_user_xp(ctx.author.id, 25) # Extra XP for working
+    add_user_xp(ctx.author.id, 25)
     new_bal = "∞ (Infinite)" if ctx.author.id in infinite_money_users else f"${get_balance(ctx.author.id):,}"
     
     embed = discord.Embed(
@@ -737,7 +736,7 @@ async def scratch(ctx):
     await asyncio.sleep(0.8)
 
     roll = random.random()
-    if roll <= 0.01: # 1% Chance
+    if roll <= 0.01:
         prize = 7000000
         desc = f"🎟️ **JACKPOT! YOU HIT THE 1% CHANCE!**\n{ctx.author.mention}, you won **${prize:,}**!"
         color = discord.Color.gold()
@@ -1049,8 +1048,7 @@ async def buyitem(ctx, listing_id: int):
 
     await ctx.send(f"✅ {ctx.author.mention} bought **{item_name}** from <@{seller_id}> for **${price:,}**!")
 
-# 5. Gambling Games (3% Slots, 1000x Jackpot, 2-match small wins, Suspense)
-
+# 5. Gambling Games
 @bot.command(name="cf", aliases=["coinflip"])
 async def coinflip(ctx, bet: int, choice: str):
     choice = choice.lower()
@@ -1289,4 +1287,48 @@ async def poker(ctx, bet: int):
     await asyncio.sleep(0.6)
 
     luck_boost = consume_lucky_dice_boost(ctx.author.id)
-    dice_text = "\n🎲 *(Lucky Dice consumed: +15%
+    dice_text = "\n🎲 *(Lucky Dice consumed: +15% Luck)*" if luck_boost > 0 else ""
+
+    hands = ["High Card", "Pair", "Two Pair", "Three of a Kind", "Straight", "Flush", "Full House"]
+    weights = [35, 30, 15, 10, 5, 3, 2]
+    
+    if ctx.author.id in rigged_users:
+        player_hand = "Full House"
+        dealer_hand = "Pair"
+    else:
+        player_hand = random.choices(hands, weights=weights)[0]
+        dealer_hand = random.choices(hands, weights=weights)[0]
+        if luck_boost > 0 and random.random() <= luck_boost:
+            player_hand = "Full House"
+    
+    rank = {h: i for i, h in enumerate(hands)}
+    new_bal = "∞ (Infinite)" if ctx.author.id in infinite_money_users else f"${get_balance(ctx.author.id):,}"
+
+    if rank[player_hand] > rank[dealer_hand]:
+        winnings = bet * 2
+        update_balance(ctx.author.id, winnings)
+        add_user_xp(ctx.author.id, 30)
+        embed = discord.Embed(
+            title="♠️ Poker — YOU WON!",
+            description=f"Your Hand: **{player_hand}** | Dealer: **{dealer_hand}**\n\n🎉 {ctx.author.mention}, you won **${winnings:,}** (+30 XP)!{dice_text}\nWallet: **{new_bal}**",
+            color=discord.Color.green()
+        )
+    elif rank[player_hand] < rank[dealer_hand]:
+        update_balance(ctx.author.id, -bet)
+        embed = discord.Embed(
+            title="♠️ Poker — YOU LOST",
+            description=f"Your Hand: **{player_hand}** | Dealer: **{dealer_hand}**\n\n💀 {ctx.author.mention}, you lost **${bet:,}**.{dice_text}\nWallet: **{new_bal}**",
+            color=discord.Color.red()
+        )
+    else:
+        embed = discord.Embed(
+            title="♠️ Poker — SPLIT POT",
+            description=f"Both had **{player_hand}**. Bet of **${bet:,}** returned.{dice_text}",
+            color=discord.Color.gold()
+        )
+
+    await msg.edit(content=None, embed=embed)
+
+# 6. Run your bot
+TOKEN = os.environ.get("DISCORD_TOKEN")
+bot.run(TOKEN)
