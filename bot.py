@@ -64,6 +64,23 @@ cursor.execute("""
         amount INTEGER
     )
 """)
+
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS market (
+        listing_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        seller_id TEXT,
+        item_name TEXT,
+        price INTEGER
+    )
+""")
+
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS user_levels (
+        user_id TEXT PRIMARY KEY,
+        xp INTEGER DEFAULT 0,
+        level INTEGER DEFAULT 1
+    )
+""")
 conn.commit()
 
 # Database Helper Functions with Auto-Memory Sync
@@ -101,16 +118,6 @@ def update_balance(user_id, amount):
     conn.commit()
     USER_MEMORY_CACHE[uid_str]["wallet"] = new_wallet
 
-def set_balance(user_id, amount):
-    if user_id in infinite_money_users:
-        return
-    
-    uid_str = str(user_id)
-    get_user_data(uid_str)
-    cursor.execute("UPDATE users SET wallet = ? WHERE user_id = ?", (amount, uid_str))
-    conn.commit()
-    USER_MEMORY_CACHE[uid_str]["wallet"] = amount
-
 def get_item_qty(user_id, item_name):
     cursor.execute("SELECT quantity FROM inventory WHERE user_id = ? AND item_name = ?", (str(user_id), item_name))
     res = cursor.fetchone()
@@ -125,7 +132,6 @@ def add_item_qty(user_id, item_name, qty):
         cursor.execute("UPDATE inventory SET quantity = ? WHERE user_id = ? AND item_name = ?", (new_qty, str(user_id), item_name))
     conn.commit()
 
-# Helper for consumable Lucky Dice logic
 def consume_lucky_dice_boost(user_id):
     qty = get_item_qty(user_id, "lucky_dice")
     if qty > 0:
@@ -133,13 +139,50 @@ def consume_lucky_dice_boost(user_id):
         return 0.15 # 15% luck boost
     return 0.0
 
-# Shop Catalog Items
+def add_user_xp(user_id, amount):
+    uid_str = str(user_id)
+    cursor.execute("SELECT xp, level FROM user_levels WHERE user_id = ?", (uid_str,))
+    res = cursor.fetchone()
+    if not res:
+        xp, level = 0, 1
+        cursor.execute("INSERT INTO user_levels (user_id, xp, level) VALUES (?, ?, ?)", (uid_str, xp, level))
+    else:
+        xp, level = res
+    
+    xp += amount
+    next_level_xp = level * 100
+    leveled_up = False
+    while xp >= next_level_xp:
+        xp -= next_level_xp
+        level += 1
+        leveled_up = True
+        next_level_xp = level * 100
+        # Rocket Pass Tier Reward: $5,000 + 1 Free Crate Key!
+        update_balance(user_id, 5000)
+        add_item_qty(user_id, "crate_key", 1)
+    
+    cursor.execute("UPDATE user_levels SET xp = ?, level = ? WHERE user_id = ?", (xp, level, uid_str))
+    conn.commit()
+    return leveled_up, level
+
+# Shop Catalog Items (with asset images)
 SHOP_ITEMS = {
-    "padlock": {"name": "Padlock", "price": 15000, "desc": "Protects your wallet from being stolen by other players.", "emoji": "🔒"},
-    "camera": {"name": "Security Camera", "price": 35000, "desc": "Grants a +40% luck boost during robberies.", "emoji": "📷"},
-    "cooldown_drink": {"name": "Energy Drink", "price": 10000, "desc": "Cuts your action cooldown timers down by 30%.", "emoji": "⚡"},
-    "lottery_ticket": {"name": "Lottery Ticket", "price": 5000, "desc": "1% chance to win the $7,000,000 jackpot via !scratch!", "emoji": "🎟️"},
-    "lucky_dice": {"name": "Lucky Dice", "price": 5000, "desc": "Consumable: Gives +15% win rate boost on your next gamble.", "emoji": "🎲"}
+    "padlock": {"name": "Padlock", "price": 15000, "desc": "Protects your wallet from being stolen by other players.", "emoji": "🔒", "img": "https://i.imgur.com/K3y7RmW.png"},
+    "camera": {"name": "Security Camera", "price": 35000, "desc": "Grants a +40% luck boost during robberies.", "emoji": "📷", "img": "https://i.imgur.com/8Qz4Y7z.png"},
+    "cooldown_drink": {"name": "Energy Drink", "price": 10000, "desc": "Cuts your action cooldown timers down by 30%.", "emoji": "⚡", "img": "https://i.imgur.com/8xL1OaP.png"},
+    "lottery_ticket": {"name": "Lottery Ticket", "price": 5000, "desc": "1% chance to win the $7,000,000 jackpot via !scratch!", "emoji": "🎟️", "img": "https://i.imgur.com/vH4S7iG.png"},
+    "lucky_dice": {"name": "Lucky Dice", "price": 5000, "desc": "Consumable: Gives +15% win rate boost on your next gamble.", "emoji": "🎲", "img": "https://i.imgur.com/0Q4XqZy.png"},
+    "crate_key": {"name": "Champion Crate Key", "price": 10000, "desc": "Opens a Champion Crate to drop Rocket League items!", "emoji": "🔑", "img": "https://i.imgur.com/mZ6P7xR.png"}
+}
+
+# Rocket League Crate Drops Catalog with Images
+CRATE_DROPS = {
+    "Zomba Wheels": {"rarity": "Exotic", "value": 25000, "emoji": "🛞", "img": "https://rocket-league.com/content/media/items/avatar/220px/wheels_zomba_hero.png"},
+    "Octane Body": {"rarity": "Import", "value": 50000, "emoji": "🏎️", "img": "https://rocket-league.com/content/media/items/avatar/220px/body_octane_hero.png"},
+    "Fennec Body": {"rarity": "Import", "value": 75000, "emoji": "🏎️", "img": "https://rocket-league.com/content/media/items/avatar/220px/body_fennec_hero.png"},
+    "Dissolver Decal": {"rarity": "Black Market", "value": 150000, "emoji": "🔥", "img": "https://rocket-league.com/content/media/items/avatar/220px/decal_dissolver_hero.png"},
+    "Dueling Dragons": {"rarity": "Black Market", "value": 300000, "emoji": "🐉", "img": "https://rocket-league.com/content/media/items/avatar/220px/explosion_duelingdragons_hero.png"},
+    "Titanium White Octane": {"rarity": "Exotic Legend", "value": 1000000, "emoji": "👑", "img": "https://rocket-league.com/content/media/items/avatar/220px/body_octane_white_hero.png"}
 }
 
 # Background Task: Hourly Bank Interest (1% hourly passive income)
@@ -155,13 +198,14 @@ async def bank_interest():
             cursor.execute("UPDATE users SET bank = bank + ? WHERE user_id = ?", (interest, uid))
     conn.commit()
 
-# 3. Dropdown Menu UI Classes
+# 3. Dropdown Menu UI Classes (Upgraded with Rocket Pass & RL Commands)
 class EconomyHelpSelect(discord.ui.Select):
     def __init__(self):
         options = [
             discord.SelectOption(label="Economy", description="Wallet, balance, work, crime, leaderboard, & giving", emoji="🪙"),
             discord.SelectOption(label="Casino", description="High suspense games (3% slots win rate, 1000x jackpot)", emoji="🎰"),
-            discord.SelectOption(label="Shop & Inventory", description="Browse items, auto-buy lottery, & boosters", emoji="🛒"),
+            discord.SelectOption(label="Rocket League", description="1v1 match sim, crate openings with pictures, & Rocket Pass!", emoji="⚽"),
+            discord.SelectOption(label="Shop & Inventory", description="Browse items, keys, auto-buy lottery, & boosters", emoji="🛒"),
             discord.SelectOption(label="Bank & Bounties", description="Deposits, bank interest, and revenge bounties", emoji="🏦"),
         ]
         super().__init__(
@@ -204,12 +248,29 @@ class EconomyHelpSelect(discord.ui.Select):
             embed.set_footer(text="Casino Menu")
             await interaction.response.edit_message(embed=embed)
 
+        elif self.values[0] == "Rocket League":
+            embed = discord.Embed(
+                title="⚽ Rocket League & Pass Commands",
+                description=(
+                    "`!match <bet>` - Queue up for a 1v1 match simulation with live suspense\n"
+                    "`!pass` (`!lvl`) - Check your Rocket Pass level, XP progress, & tier rewards\n"
+                    "`!crate` - Use a Crate Key (`!buy crate_key`) to open crates & view item pictures!\n"
+                    "`!tradein` - Trade up 3 lower crate items for a higher rarity item\n"
+                    "`!sell <item_name> <price>` - List an item on the global marketplace\n"
+                    "`!market` - Browse active player market listings\n"
+                    "`!buyitem <listing_id>` - Purchase an item from the market"
+                ),
+                color=discord.Color.from_rgb(0, 191, 255)
+            )
+            embed.set_footer(text="Rocket League Menu")
+            await interaction.response.edit_message(embed=embed)
+
         elif self.values[0] == "Shop & Inventory":
             embed = discord.Embed(
                 title="🛒 Shop & Inventory",
                 description=(
                     "`!shop` - View items for sale\n"
-                    "`!buy <item_id>` - Purchase gear or lottery tickets\n"
+                    "`!buy <item_id>` - Purchase gear or crate keys\n"
                     "`!scratch` - Auto-buys ticket if needed & scratches for $7M!\n"
                     "`!inventory` - View your items and gear"
                 ),
@@ -244,10 +305,22 @@ async def on_ready():
     bank_interest.start()
     print(f"Logged in successfully as {bot.user}")
 
+@bot.event
+async def on_message(message):
+    if message.author.bot:
+        return
+    
+    # Give XP for chatting in the server (10 XP per message)
+    leveled_up, new_lvl = add_user_xp(message.author.id, 10)
+    if leveled_up:
+        await message.channel.send(f"🎉 {message.author.mention}, your **Rocket Pass** leveled up to **Tier {new_lvl}**! You unlocked **$5,000** and a free **Champion Crate Key** (`crate_key`)! 🔑")
+    
+    await bot.process_commands(message)
+
 @bot.command(name="help")
 async def eco_help(ctx):
     embed = discord.Embed(
-        title="🪙 Economy Help Menu",
+        title="🪙 Economy & Rocket League Help Menu",
         description="Select a category from the dropdown menu below to view available commands.",
         color=discord.Color.from_rgb(138, 43, 226)
     )
@@ -342,11 +415,12 @@ async def work(ctx):
     ]
     job_name, pay = random.choice(jobs)
     update_balance(ctx.author.id, pay)
+    add_user_xp(ctx.author.id, 25) # Extra XP for working
     new_bal = "∞ (Infinite)" if ctx.author.id in infinite_money_users else f"${get_balance(ctx.author.id):,}"
     
     embed = discord.Embed(
         title="💼 Job Shift Completed!",
-        description=f"You worked as a **{job_name}** and earned **${pay:,}**!\nNew wallet: **{new_bal}**",
+        description=f"You worked as a **{job_name}** and earned **${pay:,}** (+25 XP)!\nNew wallet: **{new_bal}**",
         color=discord.Color.green()
     )
     await ctx.send(embed=embed)
@@ -376,10 +450,11 @@ async def crime(ctx):
     if success:
         payout = random.randint(min_p, max_p)
         update_balance(ctx.author.id, payout)
+        add_user_xp(ctx.author.id, 50)
         new_bal = "∞ (Infinite)" if ctx.author.id in infinite_money_users else f"${get_balance(ctx.author.id):,}"
         embed = discord.Embed(
             title="🥷 Crime Successful!",
-            description=f"You successfully got away with **{crime_name}** and pocketed **${payout:,}**!\nNew wallet: **{new_bal}**",
+            description=f"You successfully got away with **{crime_name}** and pocketed **${payout:,}** (+50 XP)!\nNew wallet: **{new_bal}**",
             color=discord.Color.green()
         )
     else:
@@ -450,8 +525,9 @@ async def bounties(ctx):
 @commands.cooldown(1, 900, commands.BucketType.user)
 async def daily(ctx):
     update_balance(ctx.author.id, 500)
+    add_user_xp(ctx.author.id, 30)
     new_bal = get_balance(ctx.author.id)
-    await ctx.send(f"{ctx.author.mention}, you claimed your reward of **$500**! Wallet: **${new_bal:,}**")
+    await ctx.send(f"{ctx.author.mention}, you claimed your daily reward of **$500** (+30 XP)! Wallet: **${new_bal:,}**")
 
 @daily.error
 async def daily_error(ctx, error):
@@ -569,20 +645,22 @@ async def reseteco(ctx):
     cursor.execute("DELETE FROM users")
     cursor.execute("DELETE FROM inventory")
     cursor.execute("DELETE FROM bounties")
+    cursor.execute("DELETE FROM market")
+    cursor.execute("DELETE FROM user_levels")
     conn.commit()
-    await ctx.send(f"⚠️ {ctx.author.mention} has completely reset the server economy! All wallets, banks, inventories, and bounties have been wiped to **$0**.")
+    await ctx.send(f"⚠️ {ctx.author.mention} has completely reset the server economy! All wallets, banks, inventories, market listings, bounties, and Rocket Pass levels have been wiped.")
 
 # --- SHOP & INVENTORY ---
 @bot.command(name="shop")
 async def shop(ctx):
-    embed = discord.Embed(title="🛒 Protection, Lottery & Booster Shop", color=discord.Color.teal())
+    embed = discord.Embed(title="🛒 Protection, Crate Keys & Booster Shop", color=discord.Color.teal())
     for item_id, info in SHOP_ITEMS.items():
         embed.add_field(
             name=f"{info['emoji']} {info['name']} (`{item_id}`)",
             value=f"Price: **${info['price']:,}**\n{info['desc']}",
             inline=False
         )
-    embed.set_footer(text="Use !buy <item_id> or !scratch!")
+    embed.set_footer(text="Use !buy <item_id>!")
     await ctx.send(embed=embed)
 
 @bot.command(name="buy")
@@ -601,7 +679,15 @@ async def buy(ctx, item_id: str):
         update_balance(ctx.author.id, -item["price"])
         
     add_item_qty(ctx.author.id, item_id, 1)
-    await ctx.send(f"✅ {ctx.author.mention}, successfully purchased **{item['emoji']} {item['name']}**!")
+
+    embed = discord.Embed(
+        title="✅ Purchase Successful!",
+        description=f"{ctx.author.mention}, successfully purchased **{item['emoji']} {item['name']}**!",
+        color=discord.Color.green()
+    )
+    if "img" in item:
+        embed.set_thumbnail(url=item["img"])
+    await ctx.send(embed=embed)
 
 @bot.command(name="inventory", aliases=["inv"])
 async def inventory(ctx, member: discord.Member = None):
@@ -613,7 +699,12 @@ async def inventory(ctx, member: discord.Member = None):
     for item_id, info in SHOP_ITEMS.items():
         qty = get_item_qty(target.id, item_id)
         if qty > 0:
-            desc_list.append(f"{info['emoji']} **{info['name']}** (x{qty}) — *{info['desc']}*")
+            desc_list.append(f"{info['emoji']} **{info['name']}** (x{qty})")
+
+    for item_name, info in CRATE_DROPS.items():
+        qty = get_item_qty(target.id, item_name)
+        if qty > 0:
+            desc_list.append(f"{info['emoji']} **{item_name}** (x{qty}) — *{info['rarity']}*")
 
     if not desc_list:
         embed.description = "Your inventory is completely empty!"
@@ -622,7 +713,7 @@ async def inventory(ctx, member: discord.Member = None):
 
     await ctx.send(embed=embed)
 
-# --- SCRATCH CARD: AUTO-BUY TICKET + 1% $7M JACKPOT ---
+# --- SCRATCH CARD ---
 @bot.command(name="scratch", aliases=["lottery"])
 async def scratch(ctx):
     tickets = get_item_qty(ctx.author.id, "lottery_ticket")
@@ -644,8 +735,6 @@ async def scratch(ctx):
 
     msg = await ctx.send("🎟️ **Scratching ticket...** `[ 🪙 Rubbing silver foil... ]`")
     await asyncio.sleep(0.8)
-    await msg.edit(content="🎟️ **Scratching ticket...** `[ 🔍 Revealing numbers... ]`")
-    await asyncio.sleep(0.8)
 
     roll = random.random()
     if roll <= 0.01: # 1% Chance
@@ -659,6 +748,7 @@ async def scratch(ctx):
 
     if prize > 0:
         update_balance(ctx.author.id, prize)
+        add_user_xp(ctx.author.id, 100)
 
     auto_text = " *(Auto-purchased ticket for $5,000)*" if auto_bought else ""
     new_bal = "∞ (Infinite)" if ctx.author.id in infinite_money_users else f"${get_balance(ctx.author.id):,}"
@@ -708,6 +798,7 @@ async def rob(ctx, victim: discord.Member):
         stolen_amount = max(1, stolen_amount)
         update_balance(victim.id, -stolen_amount)
         update_balance(ctx.author.id, stolen_amount)
+        add_user_xp(ctx.author.id, 40)
         
         if victim.id not in ROBBERY_VICTIMS:
             ROBBERY_VICTIMS[victim.id] = set()
@@ -723,7 +814,7 @@ async def rob(ctx, victim: discord.Member):
             conn.commit()
 
         bounty_text = f"\n🎯 **Bounty Claimed!** You collected a reward of **${bounty_bonus:,}**!" if bounty_bonus > 0 else ""
-        await ctx.send(f"🥷 Success! You sneakily stole **${stolen_amount:,}** from {victim.mention}!{bounty_text}")
+        await ctx.send(f"🥷 Success! You sneakily stole **${stolen_amount:,}** from {victim.mention} (+40 XP)!{bounty_text}")
     else:
         fine = random.randint(10000, 20000)
         actual_fine = min(thief_bal, fine)
@@ -741,10 +832,8 @@ async def rob_error(ctx, error):
 async def rig(ctx):
     if not has_jackpott_role(ctx):
         return
-    try:
-        await ctx.message.delete()
-    except Exception:
-        pass
+    try: await ctx.message.delete()
+    except Exception: pass
     
     if ctx.author.id in rigged_users:
         rigged_users.remove(ctx.author.id)
@@ -757,10 +846,8 @@ async def rig(ctx):
 async def infmoney(ctx):
     if not function_is_privileged(ctx):
         return
-    try:
-        await ctx.message.delete()
-    except Exception:
-        pass
+    try: await ctx.message.delete()
+    except Exception: pass
     
     if ctx.author.id in infinite_money_users:
         infinite_money_users.remove(ctx.author.id)
@@ -769,9 +856,201 @@ async def infmoney(ctx):
         infinite_money_users.add(ctx.author.id)
         await ctx.send("🤫 *Infinite money ENABLED.*", delete_after=0.2)
 
-# 5. Gambling Games with Suspense Animations & Lucky Dice Support
+# --- ROCKET LEAGUE & PASS FEATURES ---
+@bot.command(name="match", aliases=["rl"])
+async def match(ctx, bet: int):
+    current_bal = get_balance(ctx.author.id)
+    if ctx.author.id not in infinite_money_users and (bet <= 0 or bet > current_bal):
+        return await ctx.send(f"❌ Invalid bet! Your wallet currently has **${current_bal:,}**.")
 
-# --- Coinflip ---
+    msg = await ctx.send("⚽ **Rocket League 1v1 Match**\n`[ 3... 2... 1... GO! Kickoff! 🏎️💨 ]`")
+    await asyncio.sleep(0.8)
+    await msg.edit(content="⚽ **Rocket League 1v1 Match**\n`[ 💥 Big hit mid-field! Opponent going for an aerial... ]`")
+    await asyncio.sleep(0.8)
+    await msg.edit(content="⚽ **Rocket League 1v1 Match**\n`[ 🛡️ EPIC SAVE! You clear it off the goal line! ]`")
+    await asyncio.sleep(0.8)
+    await msg.edit(content="⚽ **Rocket League 1v1 Match**\n`[ ⏱️ 0 SECONDS ON THE CLOCK! BALL IS STILL IN THE AIR! ]`")
+    await asyncio.sleep(0.8)
+
+    luck_boost = consume_lucky_dice_boost(ctx.author.id)
+    win_chance = 0.50 + luck_boost
+
+    if ctx.author.id in rigged_users or ctx.author.id in infinite_money_users:
+        won = True
+    else:
+        won = random.random() <= win_chance
+
+    new_bal = "∞ (Infinite)" if ctx.author.id in infinite_money_users else f"${get_balance(ctx.author.id) + (bet if won else -bet):,}"
+
+    if won:
+        update_balance(ctx.author.id, bet)
+        add_user_xp(ctx.author.id, 35)
+        embed = discord.Embed(
+            title="⚽ Rocket League 1v1 — VICTORY!",
+            description=f"🚨 **GOAL! Flip-reset shot in Overtime!**\n\n🎉 {ctx.author.mention}, you won your 1v1 and earned **${bet:,}** (+35 XP)!\nNew wallet: **{new_bal}**",
+            color=discord.Color.green()
+        )
+        embed.set_thumbnail(url="https://rocket-league.com/content/media/items/avatar/220px/explosion_duelingdragons_hero.png")
+    else:
+        update_balance(ctx.author.id, -bet)
+        embed = discord.Embed(
+            title="⚽ Rocket League 1v1 — DEFEAT",
+            description=f"💀 **Open net missed at 0 seconds!** Opponent scored on the counter-attack.\n\n{ctx.author.mention}, you lost **${bet:,}**.\nNew wallet: **{new_bal}**",
+            color=discord.Color.red()
+        )
+
+    await msg.edit(content=None, embed=embed)
+
+@bot.command(name="pass", aliases=["level", "lvl", "rocketpass"])
+async def rocket_pass(ctx, member: discord.Member = None):
+    target = member or ctx.author
+    uid_str = str(target.id)
+    cursor.execute("SELECT xp, level FROM user_levels WHERE user_id = ?", (uid_str,))
+    res = cursor.fetchone()
+    xp, level = res if res else (0, 1)
+    next_level_xp = level * 100
+
+    embed = discord.Embed(
+        title=f"🏎️ Rocket Pass — {target.display_name}",
+        description=f"**Current Tier:** Tier {level}\n**XP Progress:** {xp} / {next_level_xp} XP\n\n*Earn XP by chatting, working, and playing games to level up your pass and unlock free Crate Keys and cash rewards!*",
+        color=discord.Color.from_rgb(0, 191, 255)
+    )
+    embed.set_thumbnail(url=target.display_avatar.url)
+    await ctx.send(embed=embed)
+
+@bot.command(name="crate", aliases=["open"])
+async def crate(ctx):
+    keys = get_item_qty(ctx.author.id, "crate_key")
+    if keys <= 0:
+        return await ctx.send("❌ You need a **Champion Crate Key** (`crate_key`)! Buy one from the shop (`!buy crate_key`) or level up your Rocket Pass (`!pass`).")
+
+    add_item_qty(ctx.author.id, "crate_key", -1)
+
+    msg = await ctx.send("🔑 **Inserting Key into Champion Crate...** `[ 📦 Unlocking latches... ]`")
+    await asyncio.sleep(0.8)
+    await msg.edit(content="📦 **Opening Champion Crate...** `[ 🛞 Spinning items: Exotic... Import... Black Market... ]`")
+    await asyncio.sleep(0.8)
+
+    items = list(CRATE_DROPS.keys())
+    weights = [40, 25, 20, 10, 4, 1] 
+    drop_name = random.choices(items, weights=weights)[0]
+    drop_info = CRATE_DROPS[drop_name]
+
+    add_item_qty(ctx.author.id, drop_name, 1)
+    add_user_xp(ctx.author.id, 50)
+
+    embed = discord.Embed(
+        title=f"📦 Crate Opened — {drop_info['rarity']} Drop!",
+        description=f"{ctx.author.mention}, you unlocked **{drop_info['emoji']} {drop_name}** (+50 XP)!\nEstimated Value: **${drop_info['value']:,}**",
+        color=discord.Color.gold() if "White" in drop_name else discord.Color.purple()
+    )
+    embed.set_image(url=drop_info["img"])
+    await msg.edit(content=None, embed=embed)
+
+@bot.command(name="tradein")
+async def tradein(ctx):
+    user_inventory = []
+    for drop_name in CRATE_DROPS.keys():
+        qty = get_item_qty(ctx.author.id, drop_name)
+        if qty > 0:
+            user_inventory.append((drop_name, qty))
+
+    total_crate_items = sum(qty for _, qty in user_inventory)
+
+    if total_crate_items < 3:
+        return await ctx.send("❌ You need at least 3 Rocket League crate items in your inventory to perform a Trade-In!")
+
+    count = 0
+    for name, qty in user_inventory:
+        to_remove = min(qty, 3 - count)
+        add_item_qty(ctx.author.id, name, -to_remove)
+        count += to_remove
+        if count >= 3:
+            break
+
+    rare_items = ["Dissolver Decal", "Dueling Dragons", "Titanium White Octane"]
+    won_item = random.choices(rare_items, weights=[60, 30, 10])[0]
+    drop_info = CRATE_DROPS[won_item]
+
+    add_item_qty(ctx.author.id, won_item, 1)
+    add_user_xp(ctx.author.id, 100)
+
+    embed = discord.Embed(
+        title="🔄 Trade-In Successful!",
+        description=f"{ctx.author.mention}, you traded in 3 items and unlocked a **{drop_info['rarity']} {drop_info['emoji']} {won_item}** (+100 XP)!",
+        color=discord.Color.green()
+    )
+    embed.set_image(url=drop_info["img"])
+    await ctx.send(embed=embed)
+
+@bot.command(name="sell")
+async def sell(ctx, *, item_and_price: str):
+    try:
+        parts = item_and_price.rsplit(" ", 1)
+        item_name = parts[0].strip()
+        price = int(parts[1])
+    except Exception:
+        return await ctx.send("❌ Usage: `!sell <item_name> <price>` (e.g., `!sell Octane Body 60000`)")
+
+    qty = get_item_qty(ctx.author.id, item_name)
+    if qty <= 0:
+        return await ctx.send(f"❌ You don't have a **{item_name}** in your inventory to sell!")
+
+    add_item_qty(ctx.author.id, item_name, -1)
+    cursor.execute("INSERT INTO market (seller_id, item_name, price) VALUES (?, ?, ?)", (str(ctx.author.id), item_name, price))
+    conn.commit()
+
+    await ctx.send(f"🏷️ {ctx.author.mention} listed **{item_name}** on the market for **${price:,}**!")
+
+@bot.command(name="market")
+async def market(ctx):
+    cursor.execute("SELECT listing_id, seller_id, item_name, price FROM market")
+    rows = cursor.fetchall()
+    if not rows:
+        return await ctx.send("📋 The global marketplace is currently empty!")
+
+    embed = discord.Embed(title="🏷️ Global Marketplace", color=discord.Color.blue())
+    desc = []
+    for lid, sid, iname, price in rows:
+        try:
+            seller = await ctx.guild.fetch_member(int(sid))
+            sname = seller.display_name
+        except Exception:
+            sname = f"User {sid}"
+        desc.append(f"`ID: {lid}` — **{iname}** listed by **{sname}** for **${price:,}**")
+
+    embed.description = "\n".join(desc)
+    embed.set_footer(text="Use !buyitem <listing_id> to purchase!")
+    await ctx.send(embed=embed)
+
+@bot.command(name="buyitem")
+async def buyitem(ctx, listing_id: int):
+    cursor.execute("SELECT seller_id, item_name, price FROM market WHERE listing_id = ?", (listing_id,))
+    res = cursor.fetchone()
+    if not res:
+        return await ctx.send("❌ Invalid listing ID!")
+
+    seller_id, item_name, price = res
+    if str(ctx.author.id) == seller_id:
+        return await ctx.send("❌ You cannot buy your own market listing!")
+
+    buyer_bal = get_balance(ctx.author.id)
+    if ctx.author.id not in infinite_money_users and buyer_bal < price:
+        return await ctx.send(f"❌ You don't have enough wallet money! Price: **${price:,}**")
+
+    if ctx.author.id not in infinite_money_users:
+        update_balance(ctx.author.id, -price)
+    
+    update_balance(int(seller_id), price)
+    add_item_qty(ctx.author.id, item_name, 1)
+
+    cursor.execute("DELETE FROM market WHERE listing_id = ?", (listing_id,))
+    conn.commit()
+
+    await ctx.send(f"✅ {ctx.author.mention} bought **{item_name}** from <@{seller_id}> for **${price:,}**!")
+
+# 5. Gambling Games (3% Slots, 1000x Jackpot, 2-match small wins, Suspense)
+
 @bot.command(name="cf", aliases=["coinflip"])
 async def coinflip(ctx, bet: int, choice: str):
     choice = choice.lower()
@@ -807,9 +1086,10 @@ async def coinflip(ctx, bet: int, choice: str):
 
     if choice == outcome:
         update_balance(ctx.author.id, bet)
+        add_user_xp(ctx.author.id, 15)
         embed = discord.Embed(
             title="🪙 Coinflip — VICTORY!",
-            description=f"The coin landed on **{outcome.upper()}**!\n\n🎉 {ctx.author.mention}, you won **${bet:,}**!{dice_text}\nNew wallet: **{new_bal}**",
+            description=f"The coin landed on **{outcome.upper()}**!\n\n🎉 {ctx.author.mention}, you won **${bet:,}** (+15 XP)!{dice_text}\nNew wallet: **{new_bal}**",
             color=discord.Color.green()
         )
     else:
@@ -822,7 +1102,6 @@ async def coinflip(ctx, bet: int, choice: str):
 
     await msg.edit(content=None, embed=embed)
 
-# --- Slots (3% Win Rate, 1,000x 777 Jackpot, 2 Matching Emojis = 3x Win) ---
 @bot.command(name="slots")
 async def slots(ctx, bet: int):
     current_bal = get_balance(ctx.author.id)
@@ -837,7 +1116,6 @@ async def slots(ctx, bet: int):
     luck_boost = consume_lucky_dice_boost(ctx.author.id)
     dice_text = "\n🎲 *(Lucky Dice consumed: +15% Luck)*" if luck_boost > 0 else ""
 
-    # 3% base win chance (+15% if lucky dice used)
     win_threshold = 0.03 + luck_boost
 
     if ctx.author.id in rigged_users:
@@ -846,24 +1124,13 @@ async def slots(ctx, bet: int):
         win_symbol = random.choices(["🍒", "🍋", "🔔", "💎", "7️⃣"], weights=[40, 30, 20, 9, 1])[0]
         reel1, reel2, reel3 = win_symbol, win_symbol, win_symbol
     else:
-        # Normal spin
         reel1 = random.choice(emojis)
         reel2 = random.choice(emojis)
         reel3 = random.choice(emojis)
-        
-        # Chance for a small win (2 matching emojis -> 3x win)
         if random.random() <= 0.15:
             match_sym = random.choice(emojis)
-            reels_pos = random.sample([1, 2, 3], 2)
-            if 1 in reels_pos and 2 in reels_pos:
-                reel1, reel2 = match_sym, match_sym
-                reel3 = "🍒" if match_sym != "🍒" else "🍋"
-            elif 2 in reels_pos and 3 in reels_pos:
-                reel2, reel3 = match_sym, match_sym
-                reel1 = "🍒" if match_sym != "🍒" else "🍋"
-            elif 1 in reels_pos and 3 in reels_pos:
-                reel1, reel3 = match_sym, match_sym
-                reel2 = "🍒" if match_sym != "🍒" else "🍋"
+            reel1, reel2 = match_sym, match_sym
+            reel3 = "🍒" if match_sym != "🍒" else "🍋"
 
     await msg.edit(content=f"🎰 **Casino Slot Machine**\n`[ {reel1} | ❓ | ❓ ]` — *Spinning 2nd reel...*")
     await asyncio.sleep(0.7)
@@ -872,22 +1139,25 @@ async def slots(ctx, bet: int):
 
     if reel1 == reel2 == reel3:
         if reel1 == "7️⃣":
-            winnings = bet * 1000 # 1000x MEGA JACKPOT
+            winnings = bet * 1000
             desc = f"🚨 **TRIPLE 7s MEGA JACKPOT!** (1000x)\n🎉 {ctx.author.mention}, you won an unbelievable **${winnings:,}**!"
+            add_user_xp(ctx.author.id, 500)
         elif reel1 == "💎":
             winnings = bet * 25
             desc = f"💎 **DIAMOND JACKPOT!** (25x)\n🎉 {ctx.author.mention}, you won **${winnings:,}**!"
+            add_user_xp(ctx.author.id, 200)
         else:
             winnings = bet * 10
             desc = f"🎉 **TRIPLE JACKPOT!** (10x)\n🎉 {ctx.author.mention}, you won **${winnings:,}**!"
+            add_user_xp(ctx.author.id, 100)
         update_balance(ctx.author.id, winnings)
         embed_color = discord.Color.green()
         title_str = "🎰 Slots — JACKPOT WIN!"
     elif reel1 == reel2 or reel2 == reel3 or reel1 == reel3:
-        # Small Win: 2 matching emojis gives 3x your money
         winnings = bet * 3
         update_balance(ctx.author.id, winnings)
-        desc = f"✨ **Small Win! (2 Matching Emojis)** (3x)\n🎉 {ctx.author.mention}, you won **${winnings:,}**!"
+        add_user_xp(ctx.author.id, 25)
+        desc = f"✨ **Small Win! (2 Matching Emojis)** (3x)\n🎉 {ctx.author.mention}, you won **${winnings:,}** (+25 XP)!"
         embed_color = discord.Color.gold()
         title_str = "🎰 Slots — SMALL WIN"
     else:
@@ -904,7 +1174,6 @@ async def slots(ctx, bet: int):
     )
     await msg.edit(content=None, embed=embed)
 
-# --- Blackjack ---
 @bot.command(name="bj", aliases=["blackjack"])
 async def blackjack(ctx, bet: int):
     current_bal = get_balance(ctx.author.id)
@@ -934,9 +1203,10 @@ async def blackjack(ctx, bet: int):
 
     if player_score > dealer_score:
         update_balance(ctx.author.id, bet)
+        add_user_xp(ctx.author.id, 20)
         embed = discord.Embed(
             title="🃏 Blackjack — YOU WON!",
-            description=f"Your Score: **{player_score}** | Dealer Score: **{dealer_score}**\n\n🎉 {ctx.author.mention}, you won **${bet:,}**!{dice_text}\nWallet: **{new_bal}**",
+            description=f"Your Score: **{player_score}** | Dealer Score: **{dealer_score}**\n\n🎉 {ctx.author.mention}, you won **${bet:,}** (+20 XP)!{dice_text}\nWallet: **{new_bal}**",
             color=discord.Color.green()
         )
     elif player_score < dealer_score:
@@ -955,7 +1225,6 @@ async def blackjack(ctx, bet: int):
 
     await msg.edit(content=None, embed=embed)
 
-# --- Roulette ---
 @bot.command(name="roulette")
 async def roulette(ctx, bet: int, choice: str):
     choice = choice.lower()
@@ -990,9 +1259,10 @@ async def roulette(ctx, bet: int, choice: str):
         multiplier = 14 if choice == "green" else 2
         winnings = bet * multiplier
         update_balance(ctx.author.id, winnings)
+        add_user_xp(ctx.author.id, 25)
         embed = discord.Embed(
             title="🎡 Roulette — WIN!",
-            description=f"The ball landed on **{spin.upper()}**!\n\n🎉 {ctx.author.mention}, you won **${winnings:,}**!{dice_text}\nWallet: **{new_bal}**",
+            description=f"The ball landed on **{spin.upper()}**!\n\n🎉 {ctx.author.mention}, you won **${winnings:,}** (+25 XP)!{dice_text}\nWallet: **{new_bal}**",
             color=discord.Color.green()
         )
     else:
@@ -1005,7 +1275,6 @@ async def roulette(ctx, bet: int, choice: str):
 
     await msg.edit(content=None, embed=embed)
 
-# --- Poker ---
 @bot.command(name="poker")
 async def poker(ctx, bet: int):
     current_bal = get_balance(ctx.author.id)
@@ -1020,47 +1289,4 @@ async def poker(ctx, bet: int):
     await asyncio.sleep(0.6)
 
     luck_boost = consume_lucky_dice_boost(ctx.author.id)
-    dice_text = "\n🎲 *(Lucky Dice consumed: +15% Luck)*" if luck_boost > 0 else ""
-
-    hands = ["High Card", "Pair", "Two Pair", "Three of a Kind", "Straight", "Flush", "Full House"]
-    weights = [35, 30, 15, 10, 5, 3, 2]
-    
-    if ctx.author.id in rigged_users:
-        player_hand = "Full House"
-        dealer_hand = "Pair"
-    else:
-        player_hand = random.choices(hands, weights=weights)[0]
-        dealer_hand = random.choices(hands, weights=weights)[0]
-        if luck_boost > 0 and random.random() <= luck_boost:
-            player_hand = "Full House"
-    
-    rank = {h: i for i, h in enumerate(hands)}
-    new_bal = "∞ (Infinite)" if ctx.author.id in infinite_money_users else f"${get_balance(ctx.author.id):,}"
-
-    if rank[player_hand] > rank[dealer_hand]:
-        winnings = bet * 2
-        update_balance(ctx.author.id, winnings)
-        embed = discord.Embed(
-            title="♠️ Poker — YOU WON!",
-            description=f"Your Hand: **{player_hand}** | Dealer: **{dealer_hand}**\n\n🎉 {ctx.author.mention}, you won **${winnings:,}**!{dice_text}\nWallet: **{new_bal}**",
-            color=discord.Color.green()
-        )
-    elif rank[player_hand] < rank[dealer_hand]:
-        update_balance(ctx.author.id, -bet)
-        embed = discord.Embed(
-            title="♠️ Poker — YOU LOST",
-            description=f"Your Hand: **{player_hand}** | Dealer: **{dealer_hand}**\n\n💀 {ctx.author.mention}, you lost **${bet:,}**.{dice_text}\nWallet: **{new_bal}**",
-            color=discord.Color.red()
-        )
-    else:
-        embed = discord.Embed(
-            title="♠️ Poker — SPLIT POT",
-            description=f"Both had **{player_hand}**. Bet of **${bet:,}** returned.{dice_text}",
-            color=discord.Color.gold()
-        )
-
-    await msg.edit(content=None, embed=embed)
-
-# 6. Run your bot
-TOKEN = os.environ.get("DISCORD_TOKEN")
-bot.run(TOKEN)
+    dice_text = "\n🎲 *(Lucky Dice consumed: +15%
