@@ -1,1334 +1,1581 @@
-import os, threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
-class Handler(BaseHTTPRequestHandler):
-    def do_GET(self): self.send_response(200); self.end_headers()
-threading.Thread(target=lambda: HTTPServer(("0.0.0.0", int(os.environ.get("PORT", 10000))), Handler).serve_forever(), daemon=True).start()
-
-import discord 
-from discord.ext import commands, tasks
-import sqlite3
+import os
+import re
+import time
 import random
+import sqlite3
 import asyncio
+import datetime
+from threading import Thread
+from flask import Flask
+import discord
+from discord.ext import commands, tasks
 
-# 1. Setup Discord Intents
-intents = discord.Intents.default()
-intents.message_content = True
+# ==========================================
+# 1. RENDER KEEP-ALIVE WEB SERVER
+# ==========================================
+app = Flask(__name__)
 
-bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
+@app.route("/")
+def home():
+    return "Bot is online and running!"
 
-# Secret tracking sets
-rigged_users = set()
-infinite_money_users = set()
+def run_web():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
 
-# Tracks who has stolen from whom: {victim_id: {thief_id}}
-ROBBERY_VICTIMS = {}
+def keep_alive():
+    t = Thread(target=run_web, daemon=True)
+    t.start()
 
-# AUTO-MEMORY BACKUP: Saves player data in code memory so it survives DB wipes/code updates!
-USER_MEMORY_CACHE = {}
+# ==========================================
+# 2. DATABASE SETUP (SQLite Persistence)
+# ==========================================
+conn = sqlite3.connect("bot_data.db", check_same_thread=False)
+c = conn.cursor()
 
-# Helper function for Owner / Co-Owner / Admin (used for infmoney and reseteco)
-function_is_privileged = lambda ctx: (
-    ctx.author.guild_permissions.administrator or 
-    any(r.name.lower() in ["owner", "co-owner"] for r in ctx.author.roles)
-)
+c.executescript("""
+CREATE TABLE IF NOT EXISTS guild_config (
+    guild_id INTEGER PRIMARY KEY,
+    prefix TEXT DEFAULT '!',
+    modlog_channel INTEGER,
+    welcome_channel INTEGER,
+    leave_channel INTEGER,
+    welcome_msg TEXT DEFAULT 'Welcome {user} to **{server}**! You are member **#{count}**.',
+    leave_msg TEXT DEFAULT '**{user}** has left the server.',
+    autorole_id INTEGER,
+    starboard_channel INTEGER,
+    starboard_threshold INTEGER DEFAULT 3,
+    automod_invites INTEGER DEFAULT 0,
+    automod_spam INTEGER DEFAULT 0,
+    automod_mentions INTEGER DEFAULT 0,
+    automod_caps INTEGER DEFAULT 0,
+    automod_links INTEGER DEFAULT 0,
+    sticky_channel INTEGER,
+    sticky_content TEXT,
+    sticky_last_msg INTEGER,
+    jtc_channel INTEGER,
+    membercount_channel INTEGER,
+    is_locked_down INTEGER DEFAULT 0
+);
 
-# Helper function specifically for the "jackpott" role (used for !rig)
-def has_jackpott_role(ctx):
-    return any(r.name.lower() == "jackpott" for r in ctx.author.roles)
+CREATE TABLE IF NOT EXISTS lockdown_backups (
+    guild_id INTEGER,
+    channel_id INTEGER,
+    prev_send_perms INTEGER,
+    PRIMARY KEY (guild_id, channel_id)
+);
 
-# 2. Setup SQLite Database & Tables
-conn = sqlite3.connect("economy.db")
-cursor = conn.cursor()
+CREATE TABLE IF NOT EXISTS lockdown_ignored (
+    guild_id INTEGER,
+    channel_id INTEGER,
+    PRIMARY KEY (guild_id, channel_id)
+);
 
-cursor.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        user_id TEXT PRIMARY KEY,
-        wallet INTEGER DEFAULT 0,
-        bank INTEGER DEFAULT 0
-    )
-""")
+CREATE TABLE IF NOT EXISTS autopurge_channels (
+    channel_id INTEGER PRIMARY KEY,
+    guild_id INTEGER,
+    delay_seconds INTEGER
+);
 
-cursor.execute("""
-    CREATE TABLE IF NOT EXISTS inventory (
-        user_id TEXT,
-        item_name TEXT,
-        quantity INTEGER DEFAULT 0,
-        PRIMARY KEY (user_id, item_name)
-    )
-""")
+CREATE TABLE IF NOT EXISTS triggers (
+    guild_id INTEGER,
+    keyword TEXT,
+    response TEXT,
+    PRIMARY KEY (guild_id, keyword)
+);
 
-cursor.execute("""
-    CREATE TABLE IF NOT EXISTS bounties (
-        target_id TEXT PRIMARY KEY,
-        issuer_id TEXT,
-        amount INTEGER
-    )
-""")
+CREATE TABLE IF NOT EXISTS mod_notes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id INTEGER,
+    user_id INTEGER,
+    mod_id INTEGER,
+    note TEXT,
+    timestamp INTEGER
+);
 
-cursor.execute("""
-    CREATE TABLE IF NOT EXISTS market (
-        listing_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        seller_id TEXT,
-        item_name TEXT,
-        price INTEGER
-    )
-""")
+CREATE TABLE IF NOT EXISTS badwords (
+    guild_id INTEGER,
+    word TEXT,
+    PRIMARY KEY (guild_id, word)
+);
 
-cursor.execute("""
-    CREATE TABLE IF NOT EXISTS user_levels (
-        user_id TEXT PRIMARY KEY,
-        xp INTEGER DEFAULT 0,
-        level INTEGER DEFAULT 1
-    )
+CREATE TABLE IF NOT EXISTS warnings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id INTEGER,
+    user_id INTEGER,
+    mod_id INTEGER,
+    reason TEXT,
+    timestamp INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS tags (
+    guild_id INTEGER,
+    name TEXT,
+    content TEXT,
+    creator_id INTEGER,
+    uses INTEGER DEFAULT 0,
+    PRIMARY KEY (guild_id, name)
+);
+
+CREATE TABLE IF NOT EXISTS starboard_posts (
+    orig_msg_id INTEGER PRIMARY KEY,
+    star_msg_id INTEGER,
+    guild_id INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS button_roles (
+    guild_id INTEGER,
+    role_id INTEGER,
+    label TEXT,
+    PRIMARY KEY (guild_id, role_id)
+);
+
+CREATE TABLE IF NOT EXISTS emoji_roles (
+    guild_id INTEGER,
+    message_id INTEGER,
+    emoji TEXT,
+    role_id INTEGER,
+    PRIMARY KEY (guild_id, message_id, emoji)
+);
+
+CREATE TABLE IF NOT EXISTS users (
+    guild_id INTEGER,
+    user_id INTEGER,
+    balance INTEGER DEFAULT 500,
+    bank INTEGER DEFAULT 0,
+    xp INTEGER DEFAULT 0,
+    level INTEGER DEFAULT 1,
+    bounty INTEGER DEFAULT 0,
+    last_daily INTEGER DEFAULT 0,
+    last_work INTEGER DEFAULT 0,
+    last_crime INTEGER DEFAULT 0,
+    PRIMARY KEY (guild_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS inventory (
+    guild_id INTEGER,
+    user_id INTEGER,
+    item_name TEXT,
+    quantity INTEGER DEFAULT 1,
+    PRIMARY KEY (guild_id, user_id, item_name)
+);
 """)
 conn.commit()
 
-# Database Helper Functions with Auto-Memory Sync
-def get_user_data(user_id):
-    uid_str = str(user_id)
-    cursor.execute("SELECT wallet, bank FROM users WHERE user_id = ?", (uid_str,))
-    result = cursor.fetchone()
-    
-    if result is None:
-        if uid_str in USER_MEMORY_CACHE:
-            w, b = USER_MEMORY_CACHE[uid_str]["wallet"], USER_MEMORY_CACHE[uid_str]["bank"]
-        else:
-            w, b = 0, 0
-            
-        cursor.execute("INSERT INTO users (user_id, wallet, bank) VALUES (?, ?, ?)", (uid_str, w, b))
-        conn.commit()
-        return {"wallet": w, "bank": b}
-    
-    USER_MEMORY_CACHE[uid_str] = {"wallet": result[0], "bank": result[1]}
-    return {"wallet": result[0], "bank": result[1]}
-
-def get_balance(user_id):
-    if user_id in infinite_money_users:
-        return 999999999999999  
-    return get_user_data(user_id)["wallet"]
-
-def update_balance(user_id, amount):
-    if user_id in infinite_money_users:
-        return  
-    
-    uid_str = str(user_id)
-    udata = get_user_data(uid_str)
-    new_wallet = max(0, udata["wallet"] + amount)
-    cursor.execute("UPDATE users SET wallet = ? WHERE user_id = ?", (new_wallet, uid_str))
+def get_config(guild_id: int):
+    c.execute("INSERT OR IGNORE INTO guild_config (guild_id) VALUES (?)", (guild_id,))
     conn.commit()
-    USER_MEMORY_CACHE[uid_str]["wallet"] = new_wallet
+    c.execute("SELECT * FROM guild_config WHERE guild_id = ?", (guild_id,))
+    cols = [col[0] for col in c.description]
+    return dict(zip(cols, c.fetchone()))
 
-def get_item_qty(user_id, item_name):
-    cursor.execute("SELECT quantity FROM inventory WHERE user_id = ? AND item_name = ?", (str(user_id), item_name))
-    res = cursor.fetchone()
-    return res[0] if res else 0
-
-def add_item_qty(user_id, item_name, qty):
-    current = get_item_qty(user_id, item_name)
-    if current == 0 and qty > 0:
-        cursor.execute("INSERT INTO inventory (user_id, item_name, quantity) VALUES (?, ?, ?)", (str(user_id), item_name, qty))
-    else:
-        new_qty = max(0, current + qty)
-        cursor.execute("UPDATE inventory SET quantity = ? WHERE user_id = ? AND item_name = ?", (new_qty, str(user_id), item_name))
+def update_config(guild_id: int, **kwargs):
+    get_config(guild_id)
+    for k, v in kwargs.items():
+        c.execute(f"UPDATE guild_config SET {k} = ? WHERE guild_id = ?", (v, guild_id))
     conn.commit()
 
-def consume_lucky_dice_boost(user_id):
-    qty = get_item_qty(user_id, "lucky_dice")
-    if qty > 0:
-        add_item_qty(user_id, "lucky_dice", -1)
-        return 0.15 # 15% luck boost
-    return 0.0
-
-def add_user_xp(user_id, amount):
-    uid_str = str(user_id)
-    cursor.execute("SELECT xp, level FROM user_levels WHERE user_id = ?", (uid_str,))
-    res = cursor.fetchone()
-    if not res:
-        xp, level = 0, 1
-        cursor.execute("INSERT INTO user_levels (user_id, xp, level) VALUES (?, ?, ?)", (uid_str, xp, level))
-    else:
-        xp, level = res
-    
-    xp += amount
-    next_level_xp = level * 100
-    leveled_up = False
-    while xp >= next_level_xp:
-        xp -= next_level_xp
-        level += 1
-        leveled_up = True
-        next_level_xp = level * 100
-        # Rocket Pass Tier Reward: $5,000 + 1 Free Crate Key!
-        update_balance(user_id, 5000)
-        add_item_qty(user_id, "crate_key", 1)
-    
-    cursor.execute("UPDATE user_levels SET xp = ?, level = ? WHERE user_id = ?", (xp, level, uid_str))
+def get_user_data(guild_id: int, user_id: int):
+    c.execute("INSERT OR IGNORE INTO users (guild_id, user_id) VALUES (?, ?)", (guild_id, user_id))
     conn.commit()
-    return leveled_up, level
+    c.execute("SELECT * FROM users WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
+    cols = [col[0] for col in c.description]
+    return dict(zip(cols, c.fetchone()))
 
-# Shop Catalog Items (with asset images)
+def update_user_data(guild_id: int, user_id: int, **kwargs):
+    get_user_data(guild_id, user_id)
+    for k, v in kwargs.items():
+        c.execute(f"UPDATE users SET {k} = ? WHERE guild_id = ? AND user_id = ?", (v, guild_id, user_id))
+    conn.commit()
+
+# ==========================================
+# 3. BOT INITIALIZATION & HELPERS
+# ==========================================
+intents = discord.Intents.all()
+
+def get_prefix(bot, message):
+    if not message.guild:
+        return "!"
+    cfg = get_config(message.guild.id)
+    return cfg["prefix"] or "!"
+
+bot = commands.Bot(command_prefix=get_prefix, intents=intents, help_command=None)
+
+# Runtime caches
+sniped_messages = {}       # channel_id -> dict
+edited_messages = {}       # channel_id -> dict
+afk_users = {}             # (guild_id, user_id) -> (reason, timestamp)
+spam_tracker = {}          # (guild_id, user_id) -> list of timestamps
+xp_cooldowns = {}          # (guild_id, user_id) -> last_xp_time
+temp_voice_channels = set()
+
 SHOP_ITEMS = {
-    "padlock": {"name": "Padlock", "price": 15000, "desc": "Protects your wallet from being stolen by other players.", "emoji": "🔒", "img": "https://i.imgur.com/K3y7RmW.png"},
-    "camera": {"name": "Security Camera", "price": 35000, "desc": "Grants a +40% luck boost during robberies.", "emoji": "📷", "img": "https://i.imgur.com/8Qz4Y7z.png"},
-    "cooldown_drink": {"name": "Energy Drink", "price": 10000, "desc": "Cuts your action cooldown timers down by 30%.", "emoji": "⚡", "img": "https://i.imgur.com/8xL1OaP.png"},
-    "lottery_ticket": {"name": "Lottery Ticket", "price": 5000, "desc": "1% chance to win the $7,000,000 jackpot via !scratch!", "emoji": "🎟️", "img": "https://i.imgur.com/vH4S7iG.png"},
-    "lucky_dice": {"name": "Lucky Dice", "price": 5000, "desc": "Consumable: Gives +15% win rate boost on your next gamble.", "emoji": "🎲", "img": "https://i.imgur.com/0Q4XqZy.png"},
-    "crate_key": {"name": "Champion Crate Key", "price": 10000, "desc": "Opens a Champion Crate to drop Rocket League items!", "emoji": "🔑", "img": "https://i.imgur.com/mZ6P7xR.png"}
+    "VIP Pass": {"price": 5000, "desc": "Shows off VIP status in your inventory."},
+    "Padlock": {"price": 1000, "desc": "Protects your wallet from one robbery attempt."},
+    "Lucky Coin": {"price": 2500, "desc": "Boosts crime & rob luck slightly."},
+    "Bank Expansion": {"price": 3000, "desc": "A prestige item for top earners."},
+    "Mystery Box": {"price": 1500, "desc": "Use !openbox for a random cash reward!"}
 }
 
-# Rocket League Crate Drops Catalog with Images
-CRATE_DROPS = {
-    "Zomba Wheels": {"rarity": "Exotic", "value": 25000, "emoji": "🛞", "img": "https://rocket-league.com/content/media/items/avatar/220px/wheels_zomba_hero.png"},
-    "Octane Body": {"rarity": "Import", "value": 50000, "emoji": "🏎️", "img": "https://rocket-league.com/content/media/items/avatar/220px/body_octane_hero.png"},
-    "Fennec Body": {"rarity": "Import", "value": 75000, "emoji": "🏎️", "img": "https://rocket-league.com/content/media/items/avatar/220px/body_fennec_hero.png"},
-    "Dissolver Decal": {"rarity": "Black Market", "value": 150000, "emoji": "🔥", "img": "https://rocket-league.com/content/media/items/avatar/220px/decal_dissolver_hero.png"},
-    "Dueling Dragons": {"rarity": "Black Market", "value": 300000, "emoji": "🐉", "img": "https://rocket-league.com/content/media/items/avatar/220px/explosion_duelingdragons_hero.png"},
-    "Titanium White Octane": {"rarity": "Exotic Legend", "value": 1000000, "emoji": "👑", "img": "https://rocket-league.com/content/media/items/avatar/220px/body_octane_white_hero.png"}
-}
+def parse_duration(duration_str: str) -> int:
+    match = re.match(r"^(\d+)([smhd])$", duration_str.lower())
+    if not match:
+        return 0
+    val, unit = int(match.group(1)), match.group(2)
+    return val * {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
 
-# Background Task: Hourly Bank Interest (1% hourly passive income)
-@tasks.loop(hours=1)
-async def bank_interest():
-    cursor.execute("SELECT user_id, bank FROM users WHERE bank > 0")
-    rows = cursor.fetchall()
-    for uid, bank_amt in rows:
-        if int(uid) in infinite_money_users:
-            continue
-        interest = int(bank_amt * 0.01)
-        if interest > 0:
-            cursor.execute("UPDATE users SET bank = bank + ? WHERE user_id = ?", (interest, uid))
-    conn.commit()
+def format_vars(text: str, member: discord.Member = None, guild: discord.Guild = None) -> str:
+    if guild:
+        text = text.replace("{server}", guild.name).replace("{count}", str(guild.member_count))
+    if member:
+        text = text.replace("{user}", member.mention).replace("{username}", member.display_name).replace("{userid}", str(member.id))
+    return text
 
-# 3. Dropdown Menu UI Classes
-class EconomyHelpSelect(discord.ui.Select):
-    def __init__(self):
-        options = [
-            discord.SelectOption(label="Economy", description="Wallet, balance, work, crime, leaderboard, & giving", emoji="🪙"),
-            discord.SelectOption(label="Casino", description="High suspense games (3% slots win rate, 1000x jackpot)", emoji="🎰"),
-            discord.SelectOption(label="Rocket League", description="1v1 match sim, crate openings with pictures, & Rocket Pass!", emoji="⚽"),
-            discord.SelectOption(label="Shop & Inventory", description="Browse items, keys, auto-buy lottery, & boosters", emoji="🛒"),
-            discord.SelectOption(label="Bank & Bounties", description="Deposits, bank interest, and revenge bounties", emoji="🏦"),
-        ]
-        super().__init__(
-            placeholder="Select a category to view commands...",
-            min_values=1,
-            max_values=1,
-            options=options
-        )
+async def send_modlog(guild: discord.Guild, title: str, description: str, color=discord.Color.blurple()):
+    cfg = get_config(guild.id)
+    ch_id = cfg.get("modlog_channel")
+    if ch_id:
+        ch = guild.get_channel(ch_id)
+        if ch:
+            embed = discord.Embed(title=title, description=description, color=color, timestamp=datetime.datetime.now(datetime.timezone.utc))
+            try:
+                await ch.send(embed=embed)
+            except discord.Forbidden:
+                pass
+
+async def update_member_counter(guild: discord.Guild):
+    cfg = get_config(guild.id)
+    ch_id = cfg.get("membercount_channel")
+    if ch_id:
+        ch = guild.get_channel(ch_id)
+        if ch:
+            try:
+                await ch.edit(name=f"📊 Members: {guild.member_count}")
+            except Exception:
+                pass
+
+# ==========================================
+# 4. PERSISTENT BUTTON ROLES (Carl-bot Style)
+# ==========================================
+class RoleButton(discord.ui.Button):
+    def __init__(self, role_id: int, label: str):
+        super().__init__(label=label, style=discord.ButtonStyle.secondary, custom_id=f"rolebtn:{role_id}")
+        self.role_id = role_id
 
     async def callback(self, interaction: discord.Interaction):
-        if self.values[0] == "Economy":
-            embed = discord.Embed(
-                title="🪙 Economy Commands",
-                description=(
-                    "`!balance [@user]` - Check wallet & wealth tier\n"
-                    "`!leaderboard` (`!lb`) - View top 10 richest players\n"
-                    "`!daily` - Claim reward ($500 every 15m)\n"
-                    "`!work` - Work a job for quick cash (5m cooldown)\n"
-                    "`!crime` - Commit a risky crime for big payouts\n"
-                    "`!give <@user> <amount>` - Transfer money to someone\n"
-                    "`!rob <@user>` - Attempt to steal money"
-                ),
-                color=discord.Color.from_rgb(138, 43, 226)
-            )
-            embed.set_footer(text="Economy Menu")
-            await interaction.response.edit_message(embed=embed)
+        role = interaction.guild.get_role(self.role_id)
+        if not role:
+            return await interaction.response.send_message("❌ That role no longer exists.", ephemeral=True)
+        try:
+            if role in interaction.user.roles:
+                await interaction.user.remove_roles(role)
+                await interaction.response.send_message(f"➖ Removed **{role.name}**.", ephemeral=True)
+            else:
+                await interaction.user.add_roles(role)
+                await interaction.response.send_message(f"➕ Added **{role.name}**!", ephemeral=True)
+        except discord.Forbidden:
+            await interaction.response.send_message("❌ Move my bot role above that role in Server Settings!", ephemeral=True)
 
-        elif self.values[0] == "Casino":
-            embed = discord.Embed(
-                title="🎰 Casino Commands (High Suspense)",
-                description=(
-                    "`!cf <bet> <heads/tails>` - Coinflip 50/50 with animated toss\n"
-                    "`!slots <bet>` - Slot machine (3% win rate, 777 pays 1000x, 2 match pays 3x)\n"
-                    "`!bj <bet>` - Blackjack vs dealer with card dealing\n"
-                    "`!roulette <bet> <red/black/green>` - Spinning wheel roulette\n"
-                    "`!poker <bet>` - Quick poker hand with river showdown"
-                ),
-                color=discord.Color.from_rgb(138, 43, 226)
-            )
-            embed.set_footer(text="Casino Menu")
-            await interaction.response.edit_message(embed=embed)
-
-        elif self.values[0] == "Rocket League":
-            embed = discord.Embed(
-                title="⚽ Rocket League & Pass Commands",
-                description=(
-                    "`!match <bet>` - Queue up for a 1v1 match simulation with live suspense\n"
-                    "`!pass` (`!lvl`) - Check your Rocket Pass level, XP progress, & tier rewards\n"
-                    "`!crate` - Use a Crate Key (`!buy crate_key`) to open crates & view item pictures!\n"
-                    "`!tradein` - Trade up 3 lower crate items for a higher rarity item\n"
-                    "`!sell <item_name> <price>` - List an item on the global marketplace\n"
-                    "`!market` - Browse active player market listings\n"
-                    "`!buyitem <listing_id>` - Purchase an item from the market"
-                ),
-                color=discord.Color.from_rgb(0, 191, 255)
-            )
-            embed.set_footer(text="Rocket League Menu")
-            await interaction.response.edit_message(embed=embed)
-
-        elif self.values[0] == "Shop & Inventory":
-            embed = discord.Embed(
-                title="🛒 Shop & Inventory",
-                description=(
-                    "`!shop` - View items for sale\n"
-                    "`!buy <item_id>` - Purchase gear or crate keys\n"
-                    "`!scratch` - Auto-buys ticket if needed & scratches for $7M!\n"
-                    "`!inventory` - View your items and gear"
-                ),
-                color=discord.Color.from_rgb(138, 43, 226)
-            )
-            embed.set_footer(text="Shop Menu")
-            await interaction.response.edit_message(embed=embed)
-
-        elif self.values[0] == "Bank & Bounties":
-            embed = discord.Embed(
-                title="🏦 Bank & Bounties",
-                description=(
-                    "`!deposit <amount/all>` (`!dep`) - Deposit cash (Earns 1% hourly interest!)\n"
-                    "`!withdraw <amount/all>` (`!with`) - Withdraw cash from bank\n"
-                    "`!bounty <@user> <amount>` - Bounty someone who robbed you\n"
-                    "`!bounties` - View active server bounties\n"
-                    "`!reseteco` - Admin command to reset server economy"
-                ),
-                color=discord.Color.from_rgb(138, 43, 226)
-            )
-            embed.set_footer(text="Bank Menu")
-            await interaction.response.edit_message(embed=embed)
-
-class EconomyHelpView(discord.ui.View):
-    def __init__(self):
+class RolePanelView(discord.ui.View):
+    def __init__(self, roles_list):
         super().__init__(timeout=None)
-        self.add_item(EconomyHelpSelect())
+        for r_id, label in roles_list[:25]:
+            self.add_item(RoleButton(r_id, label))
 
-# 4. Bot Events & Base Commands
+# ==========================================
+# 5. GLOBAL CHANNEL CHECK (#casino LOCK)
+# ==========================================
+CASINO_COMMANDS = {
+    "balance", "bal", "daily", "work", "crime", "deposit", "dep", "withdraw", "with",
+    "give", "pay", "slots", "coinflip", "cf", "blackjack", "bj", "roulette",
+    "rob", "bounty", "shop", "buy", "inventory", "inv", "openbox",
+    "leaderboard", "lb", "rank", "level"
+}
+
+@bot.check
+async def restrict_casino_channel(ctx: commands.Context):
+    if not ctx.guild or not ctx.command:
+        return True
+    if ctx.command.name in CASINO_COMMANDS:
+        if ctx.channel.name.lower() != "casino":
+            casino_ch = discord.utils.get(ctx.guild.text_channels, name="casino")
+            mention = casino_ch.mention if casino_ch else "**#casino**"
+            await ctx.send(f"🎰 Economy & casino commands can only be used in {mention}!", delete_after=6)
+            return False
+    return True
+
+# ==========================================
+# 6. EVENTS (AutoMod, Logs, JTC Voice, Starboard, Sticky, XP)
+# ==========================================
 @bot.event
 async def on_ready():
-    bank_interest.start()
-    print(f"Logged in successfully as {bot.user}")
+    c.execute("SELECT DISTINCT guild_id FROM button_roles")
+    for (g_id,) in c.fetchall():
+        c.execute("SELECT role_id, label FROM button_roles WHERE guild_id = ?", (g_id,))
+        rows = c.fetchall()
+        if rows:
+            bot.add_view(RolePanelView(rows))
+    print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
 
 @bot.event
-async def on_message(message):
-    if message.author.bot:
+async def on_command_error(ctx: commands.Context, error):
+    if isinstance(error, commands.CheckFailure):
         return
-    
-    leveled_up, new_lvl = add_user_xp(message.author.id, 10)
-    if leveled_up:
-        await message.channel.send(f"🎉 {message.author.mention}, your **Rocket Pass** leveled up to **Tier {new_lvl}**! You unlocked **$5,000** and a free **Champion Crate Key** (`crate_key`)! 🔑")
-    
-    await bot.process_commands(message)
-
-@bot.command(name="help")
-async def eco_help(ctx):
-    embed = discord.Embed(
-        title="🪙 Economy & Rocket League Help Menu",
-        description="Select a category from the dropdown menu below to view available commands.",
-        color=discord.Color.from_rgb(138, 43, 226)
-    )
-    embed.set_footer(text="Economy Menu")
-    await ctx.send(embed=embed, view=EconomyHelpView())
-
-# Balance UI
-@bot.command(name="bal", aliases=["balance"])
-async def bal(ctx, member: discord.Member = None):
-    target = member or ctx.author
-    udata = get_user_data(target.id)
-    user_bal = get_balance(target.id)
-    bank_bal = udata["bank"]
-
-    if target.id in infinite_money_users:
-        wallet_str = "∞ (Infinite)"
-        bank_str = "∞ (Infinite)"
-        rank_title, embed_color = "👑 Infinite Mogul", discord.Color.gold()
+    elif isinstance(error, commands.MissingPermissions):
+        await ctx.send("🚫 You don't have permission to use this command.", delete_after=6)
+    elif isinstance(error, commands.BotMissingPermissions):
+        await ctx.send("🚫 I am missing required permissions to perform that action.", delete_after=6)
+    elif isinstance(error, commands.MemberNotFound):
+        await ctx.send("❌ Could not find that member.", delete_after=6)
+    elif isinstance(error, commands.RoleNotFound):
+        await ctx.send("❌ Could not find that role.", delete_after=6)
+    elif isinstance(error, commands.ChannelNotFound):
+        await ctx.send("❌ Could not find that channel.", delete_after=6)
+    elif isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send(f"⚠️ Missing argument: `{error.param.name}`. Check `!help` for usage.", delete_after=7)
+    elif isinstance(error, commands.BadArgument):
+        await ctx.send("⚠️ Invalid argument provided. Check your numbers or mentions.", delete_after=7)
+    elif isinstance(error, commands.CommandNotFound):
+        pass
     else:
-        wallet_str = f"${user_bal:,}"
-        bank_str = f"${bank_bal:,}"
-        total_wealth = user_bal + bank_bal
-        if total_wealth >= 1000000000:
-            rank_title, embed_color = "👑 Mogul", discord.Color.gold()
-        elif total_wealth >= 1000000:
-            rank_title, embed_color = "💎 High Roller", discord.Color.from_rgb(0, 191, 255)
-        elif total_wealth >= 50000:
-            rank_title, embed_color = "💼 Entrepreneur", discord.Color.from_rgb(50, 205, 50)
-        elif total_wealth > 0:
-            rank_title, embed_color = "🪙 Earner", discord.Color.from_rgb(138, 43, 226)
+        print(f"Unhandled error in {ctx.command}: {error}")
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    cfg = get_config(member.guild.id)
+    if cfg["autorole_id"]:
+        role = member.guild.get_role(cfg["autorole_id"])
+        if role:
+            try:
+                await member.add_roles(role)
+            except discord.Forbidden:
+                pass
+    if cfg["welcome_channel"]:
+        ch = member.guild.get_channel(cfg["welcome_channel"])
+        if ch:
+            desc = format_vars(cfg["welcome_msg"], member=member, guild=member.guild)
+            embed = discord.Embed(title="👋 Welcome!", description=desc, color=discord.Color.green())
+            embed.set_thumbnail(url=member.display_avatar.url)
+            await ch.send(embed=embed)
+    await update_member_counter(member.guild)
+    await send_modlog(member.guild, "📥 Member Joined", f"{member.mention} (`{member.id}`)", discord.Color.green())
+
+@bot.event
+async def on_member_remove(member: discord.Member):
+    cfg = get_config(member.guild.id)
+    if cfg["leave_channel"]:
+        ch = member.guild.get_channel(cfg["leave_channel"])
+        if ch:
+            desc = format_vars(cfg["leave_msg"], member=member, guild=member.guild)
+            embed = discord.Embed(title="🚪 Member Left", description=desc, color=discord.Color.orange())
+            await ch.send(embed=embed)
+    await update_member_counter(member.guild)
+    await send_modlog(member.guild, "📤 Member Left", f"**{member}** (`{member.id}`)", discord.Color.orange())
+
+@bot.event
+async def on_member_update(before: discord.Member, after: discord.Member):
+    if before.roles != after.roles:
+        added = [r.mention for r in after.roles if r not in before.roles]
+        removed = [r.mention for r in before.roles if r not in after.roles]
+        changes = []
+        if added:
+            changes.append(f"**Added:** {', '.join(added)}")
+        if removed:
+            changes.append(f"**Removed:** {', '.join(removed)}")
+        await send_modlog(after.guild, "🎭 Member Roles Updated", f"**Member:** {after.mention}\n" + "\n".join(changes))
+
+@bot.event
+async def on_guild_channel_create(channel):
+    await send_modlog(channel.guild, "📁 Channel Created", f"**Channel:** {channel.mention} (`{channel.name}`)", discord.Color.green())
+
+@bot.event
+async def on_guild_channel_delete(channel):
+    await send_modlog(channel.guild, "🗑️ Channel Deleted", f"**Channel:** `#{channel.name}`", discord.Color.red())
+
+@bot.event
+async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+    cfg = get_config(member.guild.id)
+    jtc_id = cfg.get("jtc_channel")
+
+    # Join-To-Create Temporary Voice Channels (Premium Carl/Dyno feature)
+    if after.channel and jtc_id and after.channel.id == jtc_id:
+        overwrites = {
+            member.guild.default_role: discord.PermissionOverwrite(connect=True),
+            member: discord.PermissionOverwrite(manage_channels=True, move_members=True, connect=True)
+        }
+        new_vc = await member.guild.create_voice_channel(
+            name=f"🔊 {member.display_name}'s VC",
+            category=after.channel.category,
+            overwrites=overwrites
+        )
+        temp_voice_channels.add(new_vc.id)
+        try:
+            await member.move_to(new_vc)
+        except Exception:
+            pass
+
+    if before.channel and before.channel.id in temp_voice_channels:
+        if len(before.channel.members) == 0:
+            temp_voice_channels.discard(before.channel.id)
+            try:
+                await before.channel.delete(reason="Temporary JTC voice channel empty")
+            except Exception:
+                pass
+
+    # Voice Audit Logging
+    if before.channel != after.channel:
+        if not before.channel and after.channel:
+            await send_modlog(member.guild, "🔊 Voice Join", f"{member.mention} joined **{after.channel.name}**", discord.Color.teal())
+        elif before.channel and not after.channel:
+            await send_modlog(member.guild, "🔇 Voice Leave", f"{member.mention} left **{before.channel.name}**", discord.Color.dark_teal())
         else:
-            rank_title, embed_color = "💸 Destitute", discord.Color.dark_embed()
+            await send_modlog(member.guild, "🔄 Voice Move", f"{member.mention} moved from **{before.channel.name}** to **{after.channel.name}**", discord.Color.teal())
 
-    embed = discord.Embed(title=f"🏦 Financial Profile — {target.display_name}", color=embed_color)
-    embed.set_thumbnail(url=target.display_avatar.url)
-    embed.add_field(name="💳 Wallet Balance", value=f"**{wallet_str}**", inline=True)
-    embed.add_field(name="🏛️ Bank Account", value=f"**{bank_str}** *(Earns 1% hourly interest!)*", inline=True)
-    embed.add_field(name="🏆 Wealth Tier", value=f"**{rank_title}**", inline=False)
-    embed.set_footer(text="Secure Memory-Backed Ledger")
-    await ctx.send(embed=embed)
-
-# --- LEADERBOARD COMMAND ---
-@bot.command(name="leaderboard", aliases=["lb", "rich"])
-async def leaderboard(ctx):
-    cursor.execute("SELECT user_id, wallet, bank FROM users")
-    rows = cursor.fetchall()
-
-    if not rows:
-        return await ctx.send("❌ No economy data found yet!")
-
-    user_wealth = []
-    for row in rows:
-        uid, wallet, bank = row
-        total = 999999999999999 if int(uid) in infinite_money_users else (wallet + bank)
-        user_wealth.append((uid, total))
-
-    user_wealth.sort(key=lambda x: x[1], reverse=True)
-
-    embed = discord.Embed(
-        title="🏆 Server Wealth Leaderboard — Top 10",
-        description="Ranking the wealthiest players by total net worth (Wallet + Bank).",
-        color=discord.Color.gold()
+@bot.event
+async def on_message_delete(message: discord.Message):
+    if message.author.bot or not message.guild:
+        return
+    sniped_messages[message.channel.id] = {
+        "content": message.content or "[Attachment/Embed]",
+        "author": str(message.author),
+        "avatar": message.author.display_avatar.url,
+        "time": datetime.datetime.now(datetime.timezone.utc)
+    }
+    await send_modlog(
+        message.guild,
+        "🗑️ Message Deleted",
+        f"**Author:** {message.author.mention}\n**Channel:** {message.channel.mention}\n**Content:** {message.content or '[Attachment/Embed]'}",
+        discord.Color.red()
     )
 
-    medals = ["🥇", "🥈", "🥉"]
-    lb_text = []
-
-    for idx, (uid, wealth) in enumerate(user_wealth[:10], start=1):
-        try:
-            member = await ctx.guild.fetch_member(int(uid))
-            name = member.display_name
-        except Exception:
-            name = f"User ID: {uid}"
-
-        wealth_str = "∞ (Infinite)" if wealth >= 999999999999999 else f"${wealth:,}"
-        prefix = medals[idx - 1] if idx <= 3 else f"`#{idx}`"
-        lb_text.append(f"{prefix} **{name}** — 💰 **{wealth_str}**")
-
-    embed.add_field(name="Richest Players", value="\n".join(lb_text), inline=False)
-    embed.set_footer(text=f"Requested by {ctx.author.display_name}", icon_url=ctx.author.display_avatar.url)
-    await ctx.send(embed=embed)
-
-# --- WORK & CRIME COMMANDS ---
-@bot.command(name="work")
-@commands.cooldown(1, 300, commands.BucketType.user)
-async def work(ctx):
-    jobs = [
-        ("Discord Moderator", random.randint(200, 600)),
-        ("Roblox Game Developer", random.randint(400, 900)),
-        ("Fast Food Cashier", random.randint(150, 400)),
-        ("Python Bot Coder", random.randint(500, 1200))
-    ]
-    job_name, pay = random.choice(jobs)
-    update_balance(ctx.author.id, pay)
-    add_user_xp(ctx.author.id, 25)
-    new_bal = "∞ (Infinite)" if ctx.author.id in infinite_money_users else f"${get_balance(ctx.author.id):,}"
-    
-    embed = discord.Embed(
-        title="💼 Job Shift Completed!",
-        description=f"You worked as a **{job_name}** and earned **${pay:,}** (+25 XP)!\nNew wallet: **{new_bal}**",
-        color=discord.Color.green()
+@bot.event
+async def on_message_edit(before: discord.Message, after: discord.Message):
+    if before.author.bot or not before.guild or before.content == after.content:
+        return
+    edited_messages[before.channel.id] = {
+        "before": before.content,
+        "after": after.content,
+        "author": str(before.author),
+        "avatar": before.author.display_avatar.url,
+        "time": datetime.datetime.now(datetime.timezone.utc)
+    }
+    await send_modlog(
+        before.guild,
+        "✏️ Message Edited",
+        f"**Author:** {before.author.mention} in {before.channel.mention}\n**Before:** {before.content}\n**After:** {after.content}",
+        discord.Color.gold()
     )
-    await ctx.send(embed=embed)
 
-@work.error
-async def work_error(ctx, error):
-    if isinstance(error, commands.CommandOnCooldown):
-        mins, secs = divmod(int(error.retry_after), 60)
-        await ctx.send(f"⏳ You are tired from working! Rest for **{mins}m {secs}s** before working again.")
+@bot.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+    if not payload.guild_id or payload.member is None or payload.member.bot:
+        return
+    guild = bot.get_guild(payload.guild_id)
+    emoji_str = str(payload.emoji)
 
-@bot.command(name="crime")
-@commands.cooldown(1, 600, commands.BucketType.user)
-async def crime(ctx):
-    thief_bal = get_balance(ctx.author.id)
-    if ctx.author.id not in infinite_money_users and thief_bal < 2000:
-        ctx.command.reset_cooldown(ctx)
-        return await ctx.send("❌ You need at least **$2,000** in your wallet to cover bail if your crime fails!")
+    c.execute("SELECT role_id FROM emoji_roles WHERE guild_id = ? AND message_id = ? AND emoji = ?",
+              (guild.id, payload.message_id, emoji_str))
+    rr_row = c.fetchone()
+    if rr_row:
+        role = guild.get_role(rr_row[0])
+        if role:
+            try:
+                await payload.member.add_roles(role)
+            except discord.Forbidden:
+                pass
 
-    crimes = [
-        ("bank ATM hacking", 1500, 4000),
-        ("stealing a high-end gaming PC", 800, 2500),
-        ("robbing a convenience store", 400, 1500)
-    ]
-    crime_name, min_p, max_p = random.choice(crimes)
-    success = random.random() <= 0.50 or ctx.author.id in infinite_money_users
-
-    if success:
-        payout = random.randint(min_p, max_p)
-        update_balance(ctx.author.id, payout)
-        add_user_xp(ctx.author.id, 50)
-        new_bal = "∞ (Infinite)" if ctx.author.id in infinite_money_users else f"${get_balance(ctx.author.id):,}"
-        embed = discord.Embed(
-            title="🥷 Crime Successful!",
-            description=f"You successfully got away with **{crime_name}** and pocketed **${payout:,}** (+50 XP)!\nNew wallet: **{new_bal}**",
-            color=discord.Color.green()
-        )
-    else:
-        fine = random.randint(1000, 3000)
-        if ctx.author.id not in infinite_money_users:
-            update_balance(ctx.author.id, -fine)
-        new_bal = "∞ (Infinite)" if ctx.author.id in infinite_money_users else f"${get_balance(ctx.author.id):,}"
-        embed = discord.Embed(
-            title="🚨 Busted by Police!",
-            description=f"You failed your attempt at **{crime_name}** and paid a police fine of **${fine:,}**.\nNew wallet: **{new_bal}**",
-            color=discord.Color.red()
-        )
-    await ctx.send(embed=embed)
-
-@crime.error
-async def crime_error(ctx, error):
-    if isinstance(error, commands.CommandOnCooldown):
-        mins, secs = divmod(int(error.retry_after), 60)
-        await ctx.send(f"⏳ The police are still looking for you! Lay low for **{mins}m {secs}s**.")
-
-# --- BOUNTY SYSTEM ---
-@bot.command(name="bounty")
-async def bounty(ctx, target: discord.Member, amount: int):
-    if target.id == ctx.author.id:
-        return await ctx.send("❌ You cannot place a bounty on yourself!")
-    if amount <= 0:
-        return await ctx.send("❌ Bounty amount must be greater than $0.")
-
-    user_thief_records = ROBBERY_VICTIMS.get(ctx.author.id, set())
-    if target.id not in user_thief_records and ctx.author.id not in infinite_money_users:
-        return await ctx.send(f"❌ You can only place a bounty on **{target.display_name}** if they have successfully robbed/stolen from you!")
-
-    sender_bal = get_balance(ctx.author.id)
-    if ctx.author.id not in infinite_money_users and sender_bal < amount:
-        return await ctx.send(f"❌ You don't have enough money in your wallet to fund this bounty! Wallet: **${sender_bal:,}**")
-
-    if ctx.author.id not in infinite_money_users:
-        update_balance(ctx.author.id, -amount)
-
-    cursor.execute("INSERT OR REPLACE INTO bounties (target_id, issuer_id, amount) VALUES (?, ?, ?)", 
-                   (str(target.id), str(ctx.author.id), amount))
-    conn.commit()
-
-    await ctx.send(f"🎯 {ctx.author.mention} placed a revenge bounty of **${amount:,}** on {target.display_name} for stealing from them!")
-
-@bot.command(name="bounties", aliases=["bountylist"])
-async def bounties(ctx):
-    cursor.execute("SELECT target_id, amount FROM bounties")
-    rows = cursor.fetchall()
-    if not rows:
-        return await ctx.send("📋 There are currently no active bounties on anyone.")
-
-    embed = discord.Embed(title="🎯 Active Server Bounties", color=discord.Color.dark_red())
-    b_list = []
-    for uid, amt in rows:
-        try:
-            member = await ctx.guild.fetch_member(int(uid))
-            name = member.display_name
-        except Exception:
-            name = f"User ID: {uid}"
-        b_list.append(f"👤 **{name}** — 💰 Reward: **${amt:,}**")
-
-    embed.description = "\n".join(b_list)
-    await ctx.send(embed=embed)
-
-# --- DAILY REWARD ---
-@bot.command(name="daily")
-@commands.cooldown(1, 900, commands.BucketType.user)
-async def daily(ctx):
-    update_balance(ctx.author.id, 500)
-    add_user_xp(ctx.author.id, 30)
-    new_bal = get_balance(ctx.author.id)
-    await ctx.send(f"{ctx.author.mention}, you claimed your daily reward of **$500** (+30 XP)! Wallet: **${new_bal:,}**")
-
-@daily.error
-async def daily_error(ctx, error):
-    if isinstance(error, commands.CommandOnCooldown):
-        minutes, seconds = divmod(int(error.retry_after), 60)
-        await ctx.send(f"⏳ You are on cooldown! Try again in **{minutes}m {seconds}s**.")
-
-# --- BANKING: DEPOSIT & WITHDRAW ---
-@bot.command(name="deposit", aliases=["dep"])
-async def deposit(ctx, amount: str):
-    uid_str = str(ctx.author.id)
-    udata = get_user_data(uid_str)
-    wallet = udata["wallet"]
-
-    if wallet <= 0 and ctx.author.id not in infinite_money_users:
-        return await ctx.send("❌ You don't have any cash in your wallet to deposit!")
-
-    if amount.lower() == "all":
-        deposit_amt = wallet
-    else:
-        try:
-            deposit_amt = int(amount)
-        except ValueError:
-            return await ctx.send("❌ Please specify a valid number or `all`.")
-
-    if deposit_amt <= 0:
-        return await ctx.send("❌ Amount must be greater than $0.")
-
-    if ctx.author.id not in infinite_money_users and deposit_amt > wallet:
-        return await ctx.send(f"❌ You don't have that much cash! Your wallet has **${wallet:,}**.")
-
-    if ctx.author.id not in infinite_money_users:
-        cursor.execute("UPDATE users SET wallet = wallet - ?, bank = bank + ? WHERE user_id = ?", (deposit_amt, deposit_amt, uid_str))
-    else:
-        cursor.execute("UPDATE users SET bank = bank + ? WHERE user_id = ?", (deposit_amt, uid_str))
-    conn.commit()
-
-    updated = get_user_data(uid_str)
-    USER_MEMORY_CACHE[uid_str] = {"wallet": updated["wallet"], "bank": updated["bank"]}
-
-    w_str = "∞ (Infinite)" if ctx.author.id in infinite_money_users else f"${updated['wallet']:,}"
-    b_str = "∞ (Infinite)" if ctx.author.id in infinite_money_users else f"${updated['bank']:,}"
-    await ctx.send(f"🏦 {ctx.author.mention}, successfully deposited **${deposit_amt:,}** into your bank! (Wallet: {w_str} | Bank: {b_str})")
-
-@bot.command(name="withdraw", aliases=["with"])
-async def withdraw(ctx, amount: str):
-    uid_str = str(ctx.author.id)
-    udata = get_user_data(uid_str)
-    bank = udata["bank"]
-
-    if bank <= 0:
-        return await ctx.send("❌ You don't have any money in your bank account!")
-
-    if amount.lower() == "all":
-        withdraw_amt = bank
-    else:
-        try:
-            withdraw_amt = int(amount)
-        except ValueError:
-            return await ctx.send("❌ Please specify a valid number or `all`.")
-
-    if withdraw_amt <= 0:
-        return await ctx.send("❌ Amount must be greater than $0.")
-
-    if withdraw_amt > bank:
-        return await ctx.send(f"❌ You don't have that much in your bank! Bank balance: **${bank:,}**.")
-
-    cursor.execute("UPDATE users SET wallet = wallet + ?, bank = bank - ? WHERE user_id = ?", (withdraw_amt, withdraw_amt, uid_str))
-    conn.commit()
-
-    updated = get_user_data(uid_str)
-    USER_MEMORY_CACHE[uid_str] = {"wallet": updated["wallet"], "bank": updated["bank"]}
-
-    w_str = "∞ (Infinite)" if ctx.author.id in infinite_money_users else f"${updated['wallet']:,}"
-    b_str = f"${updated['bank']:,}"
-    await ctx.send(f"💵 {ctx.author.mention}, successfully withdrew **${withdraw_amt:,}** from your bank! (Wallet: {w_str} | Bank: {b_str})")
-
-# --- GIVE MONEY COMMAND ---
-@bot.command(name="give", aliases=["pay", "send"])
-async def give(ctx, recipient: discord.Member, amount_str: str):
-    if recipient.id == ctx.author.id:
-        return await ctx.send("❌ You cannot send money to yourself!")
-
+    if emoji_str != "⭐":
+        return
+    cfg = get_config(guild.id)
+    if not cfg["starboard_channel"]:
+        return
+    channel = guild.get_channel(payload.channel_id)
+    if not channel or channel.id == cfg["starboard_channel"]:
+        return
     try:
-        amount = int(amount_str)
-    except ValueError:
-        return await ctx.send("❌ Please specify a valid number amount.")
-
-    if amount <= 0:
-        return await ctx.send("❌ Please specify a valid amount greater than $0.")
-
-    if amount > 999999999999999:
-        return await ctx.send("❌ That amount is way too large! Keep it under 999 trillion.")
-
-    sender_bal = get_balance(ctx.author.id)
-    if ctx.author.id not in infinite_money_users and sender_bal < amount:
-        return await ctx.send(f"❌ You don't have enough wallet money! Your wallet balance is **${sender_bal:,}**.")
-
-    if ctx.author.id not in infinite_money_users:
-        update_balance(ctx.author.id, -amount)
-    
-    update_balance(recipient.id, amount)
-    
-    new_sender_bal = "∞ (Infinite)" if ctx.author.id in infinite_money_users else f"${get_balance(ctx.author.id):,}"
-    await ctx.send(f"💸 {ctx.author.mention} successfully sent **${amount:,}** to {recipient.mention}! Your new wallet balance: **{new_sender_bal}**")
-
-# --- ADMIN / OWNER SERVER-WIDE ECONOMY RESET ---
-@bot.command(name="reseteco", aliases=["reseteconomy"])
-async def reseteco(ctx):
-    if not function_is_privileged(ctx):
-        return await ctx.send("❌ You do not have permission to use this command!")
-        
-    USER_MEMORY_CACHE.clear()
-    ROBBERY_VICTIMS.clear()
-    cursor.execute("DELETE FROM users")
-    cursor.execute("DELETE FROM inventory")
-    cursor.execute("DELETE FROM bounties")
-    cursor.execute("DELETE FROM market")
-    cursor.execute("DELETE FROM user_levels")
-    conn.commit()
-    await ctx.send(f"⚠️ {ctx.author.mention} has completely reset the server economy! All wallets, banks, inventories, market listings, bounties, and Rocket Pass levels have been wiped.")
-
-# --- SHOP & INVENTORY ---
-@bot.command(name="shop")
-async def shop(ctx):
-    embed = discord.Embed(title="🛒 Protection, Crate Keys & Booster Shop", color=discord.Color.teal())
-    for item_id, info in SHOP_ITEMS.items():
-        embed.add_field(
-            name=f"{info['emoji']} {info['name']} (`{item_id}`)",
-            value=f"Price: **${info['price']:,}**\n{info['desc']}",
-            inline=False
-        )
-    embed.set_footer(text="Use !buy <item_id>!")
-    await ctx.send(embed=embed)
-
-@bot.command(name="buy")
-async def buy(ctx, item_id: str):
-    item_id = item_id.lower()
-    if item_id not in SHOP_ITEMS:
-        return await ctx.send("❌ Invalid item ID! Type `!shop` to see available items.")
-
-    item = SHOP_ITEMS[item_id]
-    user_bal = get_balance(ctx.author.id)
-
-    if ctx.author.id not in infinite_money_users and user_bal < item["price"]:
-        return await ctx.send(f"❌ You need **${item['price']:,}** in your wallet to buy a {item['name']}, but you only have **${user_bal:,}**!")
-
-    if ctx.author.id not in infinite_money_users:
-        update_balance(ctx.author.id, -item["price"])
-        
-    add_item_qty(ctx.author.id, item_id, 1)
-
-    embed = discord.Embed(
-        title="✅ Purchase Successful!",
-        description=f"{ctx.author.mention}, successfully purchased **{item['emoji']} {item['name']}**!",
-        color=discord.Color.green()
-    )
-    if "img" in item:
-        embed.set_thumbnail(url=item["img"])
-    await ctx.send(embed=embed)
-
-@bot.command(name="inventory", aliases=["inv"])
-async def inventory(ctx, member: discord.Member = None):
-    target = member or ctx.author
-    embed = discord.Embed(title=f"🎒 Inventory — {target.display_name}", color=discord.Color.blurple())
-    embed.set_thumbnail(url=target.display_avatar.url)
-
-    desc_list = []
-    for item_id, info in SHOP_ITEMS.items():
-        qty = get_item_qty(target.id, item_id)
-        if qty > 0:
-            desc_list.append(f"{info['emoji']} **{info['name']}** (x{qty})")
-
-    for item_name, info in CRATE_DROPS.items():
-        qty = get_item_qty(target.id, item_name)
-        if qty > 0:
-            desc_list.append(f"{info['emoji']} **{item_name}** (x{qty}) — *{info['rarity']}*")
-
-    if not desc_list:
-        embed.description = "Your inventory is completely empty!"
-    else:
-        embed.description = "\n".join(desc_list)
-
-    await ctx.send(embed=embed)
-
-# --- SCRATCH CARD ---
-@bot.command(name="scratch", aliases=["lottery"])
-async def scratch(ctx):
-    tickets = get_item_qty(ctx.author.id, "lottery_ticket")
-    auto_bought = False
-
-    if tickets <= 0:
-        ticket_price = SHOP_ITEMS["lottery_ticket"]["price"]
-        user_bal = get_balance(ctx.author.id)
-
-        if ctx.author.id not in infinite_money_users and user_bal < ticket_price:
-            return await ctx.send(f"❌ You don't have a Lottery Ticket and can't afford one! Ticket price: **${ticket_price:,}** (Wallet: **${user_bal:,}**).")
-
-        if ctx.author.id not in infinite_money_users:
-            update_balance(ctx.author.id, -ticket_price)
-        
-        auto_bought = True
-    else:
-        add_item_qty(ctx.author.id, "lottery_ticket", -1)
-
-    msg = await ctx.send("🎟️ **Scratching ticket...** `[ 🪙 Rubbing silver foil... ]`")
-    await asyncio.sleep(0.8)
-
-    roll = random.random()
-    if roll <= 0.01:
-        prize = 7000000
-        desc = f"🎟️ **JACKPOT! YOU HIT THE 1% CHANCE!**\n{ctx.author.mention}, you won **${prize:,}**!"
-        color = discord.Color.gold()
-    else:
-        prize = 0
-        desc = f"🎟️ **No luck!** Your scratch ticket was a loser. Better luck next time, {ctx.author.mention}!"
-        color = discord.Color.red()
-
-    if prize > 0:
-        update_balance(ctx.author.id, prize)
-        add_user_xp(ctx.author.id, 100)
-
-    auto_text = " *(Auto-purchased ticket for $5,000)*" if auto_bought else ""
-    new_bal = "∞ (Infinite)" if ctx.author.id in infinite_money_users else f"${get_balance(ctx.author.id):,}"
-    embed = discord.Embed(
-        title="🎟️ Lottery Scratch Card Result",
-        description=f"{desc}{auto_text}\nNew wallet: **{new_bal}**",
-        color=color
-    )
-    await msg.edit(content=None, embed=embed)
-
-# --- STEAL / ROB SYSTEM ---
-@bot.command(name="rob", aliases=["steal"])
-@commands.cooldown(1, 60, commands.BucketType.user)
-async def rob(ctx, victim: discord.Member):
-    if victim.id == ctx.author.id:
-        ctx.command.reset_cooldown(ctx)
-        return await ctx.send("❌ You cannot rob yourself!")
-
-    if victim.guild_permissions.administrator:
-        ctx.command.reset_cooldown(ctx)
-        return await ctx.send("🛡️ **Admin Immunity Active!** You cannot rob server administrators.")
-
-    thief_bal = get_balance(ctx.author.id)
-    victim_bal = get_balance(victim.id)
-
-    if ctx.author.id not in infinite_money_users and thief_bal < 5000:
-        ctx.command.reset_cooldown(ctx)
-        return await ctx.send("❌ You need at least **$5,000** in your wallet to fund a robbery attempt!")
-
-    if victim_bal <= 0:
-        ctx.command.reset_cooldown(ctx)
-        return await ctx.send(f"💀 **{victim.display_name}** is too broke! They have no cash in their wallet.")
-
-    victim_locks = get_item_qty(victim.id, "padlock")
-    if victim_locks > 0:
-        add_item_qty(victim.id, "padlock", -1)
-        if ctx.author.id not in infinite_money_users:
-            update_balance(ctx.author.id, -2000)
-        return await ctx.send(f"🔒 **Robbery Failed!** {victim.mention}'s **Padlock** snapped and blocked your attempt!")
-
-    camera_qty = get_item_qty(ctx.author.id, "camera")
-    success_chance = 0.45 + (0.40 if camera_qty > 0 else 0.0)
-
-    roll = random.random()
-    if roll <= success_chance or ctx.author.id in infinite_money_users:
-        stolen_amount = int(victim_bal * random.uniform(0.15, 0.30))
-        stolen_amount = max(1, stolen_amount)
-        update_balance(victim.id, -stolen_amount)
-        update_balance(ctx.author.id, stolen_amount)
-        add_user_xp(ctx.author.id, 40)
-        
-        if victim.id not in ROBBERY_VICTIMS:
-            ROBBERY_VICTIMS[victim.id] = set()
-        ROBBERY_VICTIMS[victim.id].add(ctx.author.id)
-
-        cursor.execute("SELECT amount FROM bounties WHERE target_id = ?", (str(ctx.author.id),))
-        b_res = cursor.fetchone()
-        bounty_bonus = 0
-        if b_res:
-            bounty_bonus = b_res[0]
-            update_balance(ctx.author.id, bounty_bonus)
-            cursor.execute("DELETE FROM bounties WHERE target_id = ?", (str(ctx.author.id),))
-            conn.commit()
-
-        bounty_text = f"\n🎯 **Bounty Claimed!** You collected a reward of **${bounty_bonus:,}**!" if bounty_bonus > 0 else ""
-        await ctx.send(f"🥷 Success! You sneakily stole **${stolen_amount:,}** from {victim.mention} (+40 XP)!{bounty_text}")
-    else:
-        fine = random.randint(10000, 20000)
-        actual_fine = min(thief_bal, fine)
-        if ctx.author.id not in infinite_money_users:
-            update_balance(ctx.author.id, -actual_fine)
-        await ctx.send(f"🚨 **Busted!** You got caught trying to rob {victim.mention} and had to pay a police fine of **${actual_fine:,}**!")
-
-@rob.error
-async def rob_error(ctx, error):
-    if isinstance(error, commands.CommandOnCooldown):
-        await ctx.send(f"⏳ You're on cooldown! Try again in **{int(error.retry_after)}s**.")
-
-# --- SECRET RIG & INF MONEY TOGGLES ---
-@bot.command(name="rig")
-async def rig(ctx):
-    if not has_jackpott_role(ctx):
+        msg = await channel.fetch_message(payload.message_id)
+    except discord.NotFound:
         return
-    try: await ctx.message.delete()
-    except Exception: pass
-    
-    if ctx.author.id in rigged_users:
-        rigged_users.remove(ctx.author.id)
-        await ctx.send("🤫 *Rigged mode DISABLED.*", delete_after=0.2)
-    else:
-        rigged_users.add(ctx.author.id)
-        await ctx.send("🤫 *Rigged mode ENABLED.*", delete_after=0.2)
-
-@bot.command(name="infmoney", aliases=["infinite"])
-async def infmoney(ctx):
-    if not function_is_privileged(ctx):
+    if msg.author.bot:
         return
-    try: await ctx.message.delete()
-    except Exception: pass
-    
-    if ctx.author.id in infinite_money_users:
-        infinite_money_users.remove(ctx.author.id)
-        await ctx.send("🤫 *Infinite money DISABLED.*", delete_after=0.2)
-    else:
-        infinite_money_users.add(ctx.author.id)
-        await ctx.send("🤫 *Infinite money ENABLED.*", delete_after=0.2)
 
-# --- ROCKET LEAGUE & PASS FEATURES ---
-@bot.command(name="match", aliases=["rl"])
-async def match(ctx, bet: int):
-    current_bal = get_balance(ctx.author.id)
-    if ctx.author.id not in infinite_money_users and (bet <= 0 or bet > current_bal):
-        return await ctx.send(f"❌ Invalid bet! Your wallet currently has **${current_bal:,}**.")
-
-    msg = await ctx.send("⚽ **Rocket League 1v1 Match**\n`[ 3... 2... 1... GO! Kickoff! 🏎️💨 ]`")
-    await asyncio.sleep(0.8)
-    await msg.edit(content="⚽ **Rocket League 1v1 Match**\n`[ 💥 Big hit mid-field! Opponent going for an aerial... ]`")
-    await asyncio.sleep(0.8)
-    await msg.edit(content="⚽ **Rocket League 1v1 Match**\n`[ 🛡️ EPIC SAVE! You clear it off the goal line! ]`")
-    await asyncio.sleep(0.8)
-    await msg.edit(content="⚽ **Rocket League 1v1 Match**\n`[ ⏱️ 0 SECONDS ON THE CLOCK! BALL IS STILL IN THE AIR! ]`")
-    await asyncio.sleep(0.8)
-
-    luck_boost = consume_lucky_dice_boost(ctx.author.id)
-    win_chance = 0.50 + luck_boost
-
-    if ctx.author.id in rigged_users or ctx.author.id in infinite_money_users:
-        won = True
-    else:
-        won = random.random() <= win_chance
-
-    new_bal = "∞ (Infinite)" if ctx.author.id in infinite_money_users else f"${get_balance(ctx.author.id) + (bet if won else -bet):,}"
-
-    if won:
-        update_balance(ctx.author.id, bet)
-        add_user_xp(ctx.author.id, 35)
-        embed = discord.Embed(
-            title="⚽ Rocket League 1v1 — VICTORY!",
-            description=f"🚨 **GOAL! Flip-reset shot in Overtime!**\n\n🎉 {ctx.author.mention}, you won your 1v1 and earned **${bet:,}** (+35 XP)!\nNew wallet: **{new_bal}**",
-            color=discord.Color.green()
-        )
-        embed.set_thumbnail(url="https://rocket-league.com/content/media/items/avatar/220px/explosion_duelingdragons_hero.png")
-    else:
-        update_balance(ctx.author.id, -bet)
-        embed = discord.Embed(
-            title="⚽ Rocket League 1v1 — DEFEAT",
-            description=f"💀 **Open net missed at 0 seconds!** Opponent scored on the counter-attack.\n\n{ctx.author.mention}, you lost **${bet:,}**.\nNew wallet: **{new_bal}**",
-            color=discord.Color.red()
-        )
-
-    await msg.edit(content=None, embed=embed)
-
-@bot.command(name="pass", aliases=["level", "lvl", "rocketpass"])
-async def rocket_pass(ctx, member: discord.Member = None):
-    target = member or ctx.author
-    uid_str = str(target.id)
-    cursor.execute("SELECT xp, level FROM user_levels WHERE user_id = ?", (uid_str,))
-    res = cursor.fetchone()
-    xp, level = res if res else (0, 1)
-    next_level_xp = level * 100
-
-    embed = discord.Embed(
-        title=f"🏎️ Rocket Pass — {target.display_name}",
-        description=f"**Current Tier:** Tier {level}\n**XP Progress:** {xp} / {next_level_xp} XP\n\n*Earn XP by chatting, working, and playing games to level up your pass and unlock free Crate Keys and cash rewards!*",
-        color=discord.Color.from_rgb(0, 191, 255)
-    )
-    embed.set_thumbnail(url=target.display_avatar.url)
-    await ctx.send(embed=embed)
-
-@bot.command(name="crate", aliases=["open"])
-async def crate(ctx):
-    keys = get_item_qty(ctx.author.id, "crate_key")
-    if keys <= 0:
-        return await ctx.send("❌ You need a **Champion Crate Key** (`crate_key`)! Buy one from the shop (`!buy crate_key`) or level up your Rocket Pass (`!pass`).")
-
-    add_item_qty(ctx.author.id, "crate_key", -1)
-
-    msg = await ctx.send("🔑 **Inserting Key into Champion Crate...** `[ 📦 Unlocking latches... ]`")
-    await asyncio.sleep(0.8)
-    await msg.edit(content="📦 **Opening Champion Crate...** `[ 🛞 Spinning items: Exotic... Import... Black Market... ]`")
-    await asyncio.sleep(0.8)
-
-    items = list(CRATE_DROPS.keys())
-    weights = [40, 25, 20, 10, 4, 1] 
-    drop_name = random.choices(items, weights=weights)[0]
-    drop_info = CRATE_DROPS[drop_name]
-
-    add_item_qty(ctx.author.id, drop_name, 1)
-    add_user_xp(ctx.author.id, 50)
-
-    embed = discord.Embed(
-        title=f"📦 Crate Opened — {drop_info['rarity']} Drop!",
-        description=f"{ctx.author.mention}, you unlocked **{drop_info['emoji']} {drop_name}** (+50 XP)!\nEstimated Value: **${drop_info['value']:,}**",
-        color=discord.Color.gold() if "White" in drop_name else discord.Color.purple()
-    )
-    embed.set_image(url=drop_info["img"])
-    await msg.edit(content=None, embed=embed)
-
-@bot.command(name="tradein")
-async def tradein(ctx):
-    user_inventory = []
-    for drop_name in CRATE_DROPS.keys():
-        qty = get_item_qty(ctx.author.id, drop_name)
-        if qty > 0:
-            user_inventory.append((drop_name, qty))
-
-    total_crate_items = sum(qty for _, qty in user_inventory)
-
-    if total_crate_items < 3:
-        return await ctx.send("❌ You need at least 3 Rocket League crate items in your inventory to perform a Trade-In!")
-
-    count = 0
-    for name, qty in user_inventory:
-        to_remove = min(qty, 3 - count)
-        add_item_qty(ctx.author.id, name, -to_remove)
-        count += to_remove
-        if count >= 3:
+    star_count = 0
+    for r in msg.reactions:
+        if str(r.emoji) == "⭐":
+            star_count = r.count
             break
 
-    rare_items = ["Dissolver Decal", "Dueling Dragons", "Titanium White Octane"]
-    won_item = random.choices(rare_items, weights=[60, 30, 10])[0]
-    drop_info = CRATE_DROPS[won_item]
+    if star_count >= cfg["starboard_threshold"]:
+        star_ch = guild.get_channel(cfg["starboard_channel"])
+        if not star_ch:
+            return
+        c.execute("SELECT star_msg_id FROM starboard_posts WHERE orig_msg_id = ?", (msg.id,))
+        row = c.fetchone()
+        embed = discord.Embed(description=msg.content, color=discord.Color.gold(), timestamp=msg.created_at)
+        embed.set_author(name=msg.author.display_name, icon_url=msg.author.display_avatar.url)
+        embed.add_field(name="Source", value=f"[Jump to Message]({msg.jump_url})")
+        if msg.attachments:
+            embed.set_image(url=msg.attachments[0].url)
 
-    add_item_qty(ctx.author.id, won_item, 1)
-    add_user_xp(ctx.author.id, 100)
+        if row:
+            try:
+                star_msg = await star_ch.fetch_message(row[0])
+                await star_msg.edit(content=f"⭐ **{star_count}** | {channel.mention}", embed=embed)
+            except discord.NotFound:
+                pass
+        else:
+            sent = await star_ch.send(content=f"⭐ **{star_count}** | {channel.mention}", embed=embed)
+            c.execute("INSERT INTO starboard_posts VALUES (?, ?, ?)", (msg.id, sent.id, guild.id))
+            conn.commit()
 
-    embed = discord.Embed(
-        title="🔄 Trade-In Successful!",
-        description=f"{ctx.author.mention}, you traded in 3 items and unlocked a **{drop_info['rarity']} {drop_info['emoji']} {won_item}** (+100 XP)!",
-        color=discord.Color.green()
-    )
-    embed.set_image(url=drop_info["img"])
-    await ctx.send(embed=embed)
+@bot.event
+async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
+    if not payload.guild_id:
+        return
+    guild = bot.get_guild(payload.guild_id)
+    member = guild.get_member(payload.user_id)
+    if not member or member.bot:
+        return
+    c.execute("SELECT role_id FROM emoji_roles WHERE guild_id = ? AND message_id = ? AND emoji = ?",
+              (guild.id, payload.message_id, str(payload.emoji)))
+    rr_row = c.fetchone()
+    if rr_row:
+        role = guild.get_role(rr_row[0])
+        if role:
+            try:
+                await member.remove_roles(role)
+            except discord.Forbidden:
+                pass
 
-@bot.command(name="sell")
-async def sell(ctx, *, item_and_price: str):
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot or not message.guild:
+        return
+
+    g_id = message.guild.id
+    u_id = message.author.id
+    cfg = get_config(g_id)
+    is_admin = message.author.guild_permissions.manage_messages
+
+    # 0. Auto-Purge Channel Check (Premium feature)
+    c.execute("SELECT delay_seconds FROM autopurge_channels WHERE channel_id = ?", (message.channel.id,))
+    ap_row = c.fetchone()
+    if ap_row and not message.content.startswith(cfg["prefix"]):
+        asyncio.create_task(delayed_delete(message, ap_row[0]))
+
+    # 1. AFK Check
+    if (g_id, u_id) in afk_users:
+        del afk_users[(g_id, u_id)]
+        await message.channel.send(f"Welcome back {message.author.mention}! I removed your AFK status.", delete_after=5)
+
+    for m in message.mentions:
+        if (g_id, m.id) in afk_users:
+            reason, ts = afk_users[(g_id, m.id)]
+            await message.channel.send(f"💤 **{m.display_name}** is currently AFK: {reason} (<t:{int(ts)}:R>)", delete_after=8)
+
+    # 2. Auto-Mod (Skips Moderators)
+    if not is_admin:
+        if cfg["automod_invites"] and re.search(r"(discord\.gg/|discord\.com/invite/)", message.content, re.I):
+            await message.delete()
+            return await message.channel.send(f"🚫 {message.author.mention}, invite links are not allowed!", delete_after=5)
+
+        if cfg["automod_links"] and re.search(r"https?://\S+", message.content, re.I):
+            await message.delete()
+            return await message.channel.send(f"🚫 {message.author.mention}, external links are not allowed!", delete_after=5)
+
+        if cfg["automod_mentions"] and len(message.mentions) >= 5:
+            await message.delete()
+            return await message.channel.send(f"🚫 {message.author.mention}, do not mass-mention users!", delete_after=5)
+
+        if cfg["automod_caps"] and len(message.content) >= 10:
+            letters = [ch for ch in message.content if ch.isalpha()]
+            if len(letters) >= 8 and sum(1 for ch in letters if ch.isupper()) / len(letters) >= 0.75:
+                await message.delete()
+                return await message.channel.send(f"🚫 {message.author.mention}, please turn off Caps Lock!", delete_after=5)
+
+        c.execute("SELECT word FROM badwords WHERE guild_id = ?", (g_id,))
+        banned = [r[0] for r in c.fetchall()]
+        lower_msg = message.content.lower()
+        if any(w in lower_msg for w in banned):
+            await message.delete()
+            return await message.channel.send(f"🚫 {message.author.mention}, watch your language!", delete_after=5)
+
+        if cfg["automod_spam"]:
+            now = time.time()
+            timestamps = spam_tracker.get((g_id, u_id), [])
+            timestamps = [t for t in timestamps if now - t < 5]
+            timestamps.append(now)
+            spam_tracker[(g_id, u_id)] = timestamps
+            if len(timestamps) >= 5:
+                spam_tracker[(g_id, u_id)] = []
+                try:
+                    await message.author.timeout(datetime.timedelta(minutes=2), reason="Auto-Mod: Spamming")
+                    await message.channel.send(f"🔇 {message.author.mention} was muted for 2 minutes for spamming.")
+                except discord.Forbidden:
+                    pass
+
+    # 3. Auto-Responder Triggers (Carl-bot Premium feature)
+    if not message.content.startswith(cfg["prefix"]):
+        c.execute("SELECT keyword, response FROM triggers WHERE guild_id = ?", (g_id,))
+        msg_lower = message.content.lower()
+        for kw, resp in c.fetchall():
+            if kw in msg_lower:
+                await message.channel.send(format_vars(resp, member=message.author, guild=message.guild))
+                break
+
+    # 4. Chat XP Leveling
+    now = time.time()
+    if now - xp_cooldowns.get((g_id, u_id), 0) >= 20:
+        xp_cooldowns[(g_id, u_id)] = now
+        ud = get_user_data(g_id, u_id)
+        new_xp = ud["xp"] + random.randint(15, 30)
+        needed = ud["level"] * 150
+        if new_xp >= needed:
+            new_lvl = ud["level"] + 1
+            reward = new_lvl * 250
+            update_user_data(g_id, u_id, xp=0, level=new_lvl, balance=ud["balance"] + reward)
+            casino_ch = discord.utils.get(message.guild.text_channels, name="casino")
+            target_ch = casino_ch if casino_ch else message.channel
+            await target_ch.send(f"🎉 {message.author.mention} leveled up to **Level {new_lvl}** and earned **${reward:,}**!")
+        else:
+            update_user_data(g_id, u_id, xp=new_xp)
+
+    # 5. Sticky Message Handler
+    if cfg["sticky_channel"] == message.channel.id and cfg["sticky_content"]:
+        if cfg["sticky_last_msg"]:
+            try:
+                old_sticky = await message.channel.fetch_message(cfg["sticky_last_msg"])
+                await old_sticky.delete()
+            except Exception:
+                pass
+        sent_sticky = await message.channel.send(f"📌 **Sticky Message:**\n{cfg['sticky_content']}")
+        update_config(g_id, sticky_last_msg=sent_sticky.id)
+
+    await bot.process_commands(message)
+
+async def delayed_delete(message: discord.Message, delay: int):
+    await asyncio.sleep(delay)
     try:
-        parts = item_and_price.rsplit(" ", 1)
-        item_name = parts[0].strip()
-        price = int(parts[1])
+        await message.delete()
     except Exception:
-        return await ctx.send("❌ Usage: `!sell <item_name> <price>` (e.g., `!sell Octane Body 60000`)")
+        pass
 
-    qty = get_item_qty(ctx.author.id, item_name)
-    if qty <= 0:
-        return await ctx.send(f"❌ You don't have a **{item_name}** in your inventory to sell!")
+# ==========================================
+# 7. SERVER LOCKDOWN & UNLOCKDOWN (Smart Permission Backup)
+# ==========================================
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def lockdownignore(ctx, channel: discord.TextChannel):
+    c.execute("SELECT 1 FROM lockdown_ignored WHERE guild_id = ? AND channel_id = ?", (ctx.guild.id, channel.id))
+    if c.fetchone():
+        c.execute("DELETE FROM lockdown_ignored WHERE guild_id = ? AND channel_id = ?", (ctx.guild.id, channel.id))
+        conn.commit()
+        await ctx.send(f"✅ Removed {channel.mention} from the lockdown ignore list.")
+    else:
+        c.execute("INSERT INTO lockdown_ignored VALUES (?, ?)", (ctx.guild.id, channel.id))
+        conn.commit()
+        await ctx.send(f"🛡️ {channel.mention} will now stay unlocked during a server `!lockdown`.")
 
-    add_item_qty(ctx.author.id, item_name, -1)
-    cursor.execute("INSERT INTO market (seller_id, item_name, price) VALUES (?, ?, ?)", (str(ctx.author.id), item_name, price))
-    conn.commit()
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def lockdown(ctx, *, reason: str = "Emergency Server Lockdown"):
+    cfg = get_config(ctx.guild.id)
+    if cfg["is_locked_down"]:
+        return await ctx.send("⚠️ The server is already in lockdown! Run `!unlockdown` to lift it.")
 
-    await ctx.send(f"🏷️ {ctx.author.mention} listed **{item_name}** on the market for **${price:,}**!")
+    status_msg = await ctx.send("🚨 **Initiating Server-Wide Lockdown...** Backing up permissions and locking channels...")
+    c.execute("SELECT channel_id FROM lockdown_ignored WHERE guild_id = ?", (ctx.guild.id,))
+    ignored_ids = {r[0] for r in c.fetchall()}
+    ignored_ids.add(ctx.channel.id)  # Keep the command channel open for admins
 
-@bot.command(name="market")
-async def market(ctx):
-    cursor.execute("SELECT listing_id, seller_id, item_name, price FROM market")
-    rows = cursor.fetchall()
-    if not rows:
-        return await ctx.send("📋 The global marketplace is currently empty!")
+    c.execute("DELETE FROM lockdown_backups WHERE guild_id = ?", (ctx.guild.id,))
+    locked_count = 0
+    default_role = ctx.guild.default_role
 
-    embed = discord.Embed(title="🏷️ Global Marketplace", color=discord.Color.blue())
-    desc = []
-    for lid, sid, iname, price in rows:
+    for ch in ctx.guild.text_channels:
+        if ch.id in ignored_ids:
+            continue
+        overwrite = ch.overwrites_for(default_role)
+        # Store previous send_messages state: 1 = True, 0 = False, -1 = None (inherit)
+        prev_val = 1 if overwrite.send_messages is True else (0 if overwrite.send_messages is False else -1)
+        c.execute("INSERT INTO lockdown_backups VALUES (?, ?, ?)", (ctx.guild.id, ch.id, prev_val))
+        overwrite.send_messages = False
         try:
-            seller = await ctx.guild.fetch_member(int(sid))
-            sname = seller.display_name
-        except Exception:
-            sname = f"User {sid}"
-        desc.append(f"`ID: {lid}` — **{iname}** listed by **{sname}** for **${price:,}**")
+            await ch.set_permissions(default_role, overwrite=overwrite, reason=f"Server Lockdown by {ctx.author}: {reason}")
+            locked_count += 1
+        except discord.Forbidden:
+            pass
 
-    embed.description = "\n".join(desc)
-    embed.set_footer(text="Use !buyitem <listing_id> to purchase!")
+    conn.commit()
+    update_config(ctx.guild.id, is_locked_down=1)
+
+    embed = discord.Embed(
+        title="🚨 SERVER LOCKDOWN ACTIVATED",
+        description=f"**Reason:** {reason}\n**Channels Locked:** {locked_count}\n**Moderator:** {ctx.author.mention}\n\nAdmins can run `!unlockdown` to restore all channels.",
+        color=discord.Color.dark_red(),
+        timestamp=datetime.datetime.now(datetime.timezone.utc)
+    )
+    await status_msg.edit(content=None, embed=embed)
+    await send_modlog(ctx.guild, "🚨 Server Lockdown", f"**Moderator:** {ctx.author}\n**Locked Channels:** {locked_count}\n**Reason:** {reason}", discord.Color.dark_red())
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def unlockdown(ctx):
+    cfg = get_config(ctx.guild.id)
+    if not cfg["is_locked_down"]:
+        return await ctx.send("ℹ️ The server is not currently locked down.")
+
+    status_msg = await ctx.send("🔓 **Lifting Server Lockdown...** Restoring original channel permissions...")
+    c.execute("SELECT channel_id, prev_send_perms FROM lockdown_backups WHERE guild_id = ?", (ctx.guild.id,))
+    backups = c.fetchall()
+    default_role = ctx.guild.default_role
+    restored_count = 0
+
+    for ch_id, prev_val in backups:
+        ch = ctx.guild.get_channel(ch_id)
+        if not ch:
+            continue
+        overwrite = ch.overwrites_for(default_role)
+        overwrite.send_messages = True if prev_val == 1 else (False if prev_val == 0 else None)
+        try:
+            await ch.set_permissions(default_role, overwrite=overwrite, reason=f"Server Unlockdown by {ctx.author}")
+            restored_count += 1
+        except discord.Forbidden:
+            pass
+
+    c.execute("DELETE FROM lockdown_backups WHERE guild_id = ?", (ctx.guild.id,))
+    conn.commit()
+    update_config(ctx.guild.id, is_locked_down=0)
+
+    embed = discord.Embed(
+        title="🔓 SERVER LOCKDOWN LIFTED",
+        description=f"All **{restored_count}** channels have been restored to their previous permissions.\n**Moderator:** {ctx.author.mention}",
+        color=discord.Color.green(),
+        timestamp=datetime.datetime.now(datetime.timezone.utc)
+    )
+    await status_msg.edit(content=None, embed=embed)
+    await send_modlog(ctx.guild, "🔓 Server Unlockdown", f"**Moderator:** {ctx.author}\n**Restored Channels:** {restored_count}", discord.Color.green())
+
+# ==========================================
+# 8. DYNO MODERATION, NOTES, MASSROLE & AUTOMOD
+# ==========================================
+@bot.command()
+@commands.has_permissions(kick_members=True)
+async def kick(ctx, member: discord.Member, *, reason="No reason provided"):
+    await member.kick(reason=reason)
+    await ctx.send(f"👢 Kicked **{member}** | Reason: {reason}")
+    await send_modlog(ctx.guild, "Member Kicked", f"**User:** {member}\n**Mod:** {ctx.author}\n**Reason:** {reason}", discord.Color.orange())
+
+@bot.command()
+@commands.has_permissions(ban_members=True)
+async def ban(ctx, member: discord.Member, *, reason="No reason provided"):
+    await member.ban(reason=reason)
+    await ctx.send(f"🔨 Banned **{member}** | Reason: {reason}")
+    await send_modlog(ctx.guild, "Member Banned", f"**User:** {member}\n**Mod:** {ctx.author}\n**Reason:** {reason}", discord.Color.red())
+
+@bot.command()
+@commands.has_permissions(ban_members=True)
+async def tempban(ctx, member: discord.Member, duration: str, *, reason="No reason provided"):
+    secs = parse_duration(duration)
+    if secs <= 0:
+        return await ctx.send("Invalid duration! Use format like `10m`, `2h`, `1d`.")
+    await member.ban(reason=f"Tempban ({duration}): {reason}")
+    await ctx.send(f"⏳ Temp-banned **{member}** for **{duration}** | Reason: {reason}")
+    await asyncio.sleep(secs)
+    try:
+        await ctx.guild.unban(member, reason="Tempban expired")
+    except Exception:
+        pass
+
+@bot.command()
+@commands.has_permissions(ban_members=True)
+async def unban(ctx, user_id: int):
+    user = await bot.fetch_user(user_id)
+    await ctx.guild.unban(user)
+    await ctx.send(f"✅ Unbanned **{user}**.")
+
+@bot.command()
+@commands.has_permissions(moderate_members=True)
+async def mute(ctx, member: discord.Member, duration: str = "10m", *, reason="No reason provided"):
+    secs = parse_duration(duration)
+    if secs <= 0:
+        return await ctx.send("Invalid duration! Use format like `10m`, `1h`, `1d`.")
+    await member.timeout(datetime.timedelta(seconds=secs), reason=reason)
+    await ctx.send(f"🔇 Muted **{member}** for **{duration}** | Reason: {reason}")
+    await send_modlog(ctx.guild, "Member Muted", f"**User:** {member}\n**Duration:** {duration}\n**Mod:** {ctx.author}\n**Reason:** {reason}")
+
+@bot.command()
+@commands.has_permissions(moderate_members=True)
+async def unmute(ctx, member: discord.Member):
+    await member.timeout(None)
+    await ctx.send(f"🔊 Unmuted **{member}**.")
+
+@bot.command()
+@commands.has_permissions(manage_messages=True)
+async def warn(ctx, member: discord.Member, *, reason="No reason provided"):
+    c.execute("INSERT INTO warnings (guild_id, user_id, mod_id, reason, timestamp) VALUES (?, ?, ?, ?, ?)",
+              (ctx.guild.id, member.id, ctx.author.id, reason, int(time.time())))
+    conn.commit()
+    await ctx.send(f"⚠️ Warned **{member}** | Reason: {reason}")
+    await send_modlog(ctx.guild, "Member Warned", f"**User:** {member}\n**Mod:** {ctx.author}\n**Reason:** {reason}", discord.Color.gold())
+
+@bot.command()
+async def warnings(ctx, member: discord.Member = None):
+    member = member or ctx.author
+    c.execute("SELECT id, mod_id, reason, timestamp FROM warnings WHERE guild_id = ? AND user_id = ?", (ctx.guild.id, member.id))
+    rows = c.fetchall()
+    if not rows:
+        return await ctx.send(f"✅ **{member.display_name}** has no warnings.")
+    desc = "\n".join([f"**#{r[0]}** - {r[2]} (by <@{r[1]}>, <t:{r[3]}:R>)" for r in rows])
+    embed = discord.Embed(title=f"⚠️ Warnings for {member.display_name}", description=desc, color=discord.Color.gold())
     await ctx.send(embed=embed)
 
-@bot.command(name="buyitem")
-async def buyitem(ctx, listing_id: int):
-    cursor.execute("SELECT seller_id, item_name, price FROM market WHERE listing_id = ?", (listing_id,))
-    res = cursor.fetchone()
-    if not res:
-        return await ctx.send("❌ Invalid listing ID!")
-
-    seller_id, item_name, price = res
-    if str(ctx.author.id) == seller_id:
-        return await ctx.send("❌ You cannot buy your own market listing!")
-
-    buyer_bal = get_balance(ctx.author.id)
-    if ctx.author.id not in infinite_money_users and buyer_bal < price:
-        return await ctx.send(f"❌ You don't have enough wallet money! Price: **${price:,}**")
-
-    if ctx.author.id not in infinite_money_users:
-        update_balance(ctx.author.id, -price)
-    
-    update_balance(int(seller_id), price)
-    add_item_qty(ctx.author.id, item_name, 1)
-
-    cursor.execute("DELETE FROM market WHERE listing_id = ?", (listing_id,))
+@bot.command()
+@commands.has_permissions(manage_messages=True)
+async def clearwarns(ctx, member: discord.Member):
+    c.execute("DELETE FROM warnings WHERE guild_id = ? AND user_id = ?", (ctx.guild.id, member.id))
     conn.commit()
+    await ctx.send(f"🧹 Cleared all warnings for **{member}**.")
 
-    await ctx.send(f"✅ {ctx.author.mention} bought **{item_name}** from <@{seller_id}> for **${price:,}**!")
+@bot.command()
+@commands.has_permissions(manage_messages=True)
+async def note(ctx, member: discord.Member, *, text: str):
+    c.execute("INSERT INTO mod_notes (guild_id, user_id, mod_id, note, timestamp) VALUES (?, ?, ?, ?, ?)",
+              (ctx.guild.id, member.id, ctx.author.id, text, int(time.time())))
+    conn.commit()
+    await ctx.send(f"📝 Added moderator note for **{member.display_name}**.")
 
-# 5. Gambling Games
-@bot.command(name="cf", aliases=["coinflip"])
-async def coinflip(ctx, bet: int, choice: str):
-    choice = choice.lower()
-    if choice not in ["heads", "tails"]:
-        return await ctx.send("❌ Choose either `heads` or `tails`. Example: `!cf 500 heads`")
-    
-    current_bal = get_balance(ctx.author.id)
-    if ctx.author.id not in infinite_money_users and (bet <= 0 or bet > current_bal):
-        return await ctx.send(f"❌ Invalid bet! Your wallet currently has **${current_bal:,}**.")
+@bot.command()
+@commands.has_permissions(manage_messages=True)
+async def notes(ctx, member: discord.Member):
+    c.execute("SELECT id, mod_id, note, timestamp FROM mod_notes WHERE guild_id = ? AND user_id = ?", (ctx.guild.id, member.id))
+    rows = c.fetchall()
+    if not rows:
+        return await ctx.send(f"📝 No moderator notes for **{member.display_name}**.")
+    desc = "\n".join([f"**#{r[0]}** - {r[2]} (by <@{r[1]}>, <t:{r[3]}:R>)" for r in rows])
+    await ctx.send(embed=discord.Embed(title=f"📝 Mod Notes: {member.display_name}", description=desc, color=discord.Color.blurple()))
 
-    msg = await ctx.send("🪙 **Coinflip Arena**\n`[ 🔄 Toss in progress... ]`")
-    await asyncio.sleep(0.6)
-    await msg.edit(content="🪙 **Coinflip Arena**\n`[ 🌀 Flipping high in the air... ]`")
-    await asyncio.sleep(0.6)
-    await msg.edit(content="🪙 **Coinflip Arena**\n`[ 🔍 The coin is about to land... ]`")
-    await asyncio.sleep(0.6)
+@bot.command()
+@commands.has_permissions(manage_messages=True)
+async def purge(ctx, amount: int):
+    deleted = await ctx.channel.purge(limit=amount + 1)
+    await ctx.send(f"🧹 Deleted **{len(deleted)-1}** messages.", delete_after=4)
 
-    luck_boost = consume_lucky_dice_boost(ctx.author.id)
-    dice_text = "\n🎲 *(Lucky Dice consumed: +15% Luck)*" if luck_boost > 0 else ""
+@bot.command()
+@commands.has_permissions(manage_channels=True)
+async def autopurge(ctx, seconds: int):
+    if seconds <= 0:
+        c.execute("DELETE FROM autopurge_channels WHERE channel_id = ?", (ctx.channel.id,))
+        conn.commit()
+        return await ctx.send("🛑 Auto-purge disabled for this channel.")
+    c.execute("INSERT OR REPLACE INTO autopurge_channels VALUES (?, ?, ?)", (ctx.channel.id, ctx.guild.id, seconds))
+    conn.commit()
+    await ctx.send(f"⏳ Messages in this channel will now auto-delete after **{seconds} seconds**.")
 
-    if ctx.author.id in rigged_users:
-        outcome = choice
+@bot.command()
+@commands.has_permissions(manage_channels=True)
+async def slowmode(ctx, seconds: int):
+    await ctx.channel.edit(slowmode_delay=seconds)
+    await ctx.send(f"⏱️ Slowmode set to **{seconds} seconds**.")
+
+@bot.command()
+@commands.has_permissions(manage_channels=True)
+async def lock(ctx):
+    await ctx.channel.set_permissions(ctx.guild.default_role, send_messages=False)
+    await ctx.send("🔒 Channel locked.")
+
+@bot.command()
+@commands.has_permissions(manage_channels=True)
+async def unlock(ctx):
+    await ctx.channel.set_permissions(ctx.guild.default_role, send_messages=True)
+    await ctx.send("🔓 Channel unlocked.")
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def nuke(ctx):
+    pos = ctx.channel.position
+    new_ch = await ctx.channel.clone(reason=f"Channel nuked by {ctx.author}")
+    await new_ch.edit(position=pos)
+    await ctx.channel.delete()
+    await new_ch.send("💥 **Channel has been nuked!**")
+
+@bot.command()
+@commands.has_permissions(manage_nicknames=True)
+async def nick(ctx, member: discord.Member, *, nickname: str = None):
+    await member.edit(nick=nickname)
+    await ctx.send(f"✏️ Updated nickname for **{member}**.")
+
+@bot.command()
+@commands.has_permissions(manage_roles=True)
+async def role(ctx, member: discord.Member, role: discord.Role):
+    if role in member.roles:
+        await member.remove_roles(role)
+        await ctx.send(f"➖ Removed **{role.name}** from **{member}**.")
     else:
-        if luck_boost > 0 and random.random() <= luck_boost:
-            outcome = choice 
-        else:
-            outcome = random.choice(["heads", "tails"])
+        await member.add_roles(role)
+        await ctx.send(f"➕ Added **{role.name}** to **{member}**.")
 
-    if ctx.author.id in infinite_money_users:
-        new_bal = "∞ (Infinite)"
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def massrole(ctx, action: str, role: discord.Role):
+    action = action.lower()
+    if action not in ("add", "remove"):
+        return await ctx.send("Usage: `!massrole <add|remove> @Role`")
+    msg = await ctx.send(f"⏳ Processing `{action}` **{role.name}** for all human members...")
+    count = 0
+    for m in ctx.guild.members:
+        if m.bot:
+            continue
+        try:
+            if action == "add" and role not in m.roles:
+                await m.add_roles(role)
+                count += 1
+            elif action == "remove" and role in m.roles:
+                await m.remove_roles(role)
+                count += 1
+        except discord.Forbidden:
+            pass
+    await msg.edit(content=f"✅ Successfully updated **{role.name}** for **{count}** members!")
+
+@bot.command()
+@commands.has_permissions(move_members=True)
+async def vcmove(ctx, member: discord.Member, channel: discord.VoiceChannel):
+    await member.move_to(channel)
+    await ctx.send(f"🔊 Moved **{member.display_name}** to **{channel.name}**.")
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def automod(ctx, feature: str, state: str):
+    feature = feature.lower()
+    val = 1 if state.lower() in ("on", "enable", "true", "1") else 0
+    mapping = {
+        "invites": "automod_invites",
+        "spam": "automod_spam",
+        "mentions": "automod_mentions",
+        "caps": "automod_caps",
+        "links": "automod_links"
+    }
+    if feature in mapping:
+        update_config(ctx.guild.id, **{mapping[feature]: val})
+        await ctx.send(f"🛡️ Auto-Mod **{feature}** set to **{'ON' if val else 'OFF'}**.")
     else:
-        new_bal = f"${get_balance(ctx.author.id) + (bet if choice == outcome else -bet):,}"
+        await ctx.send("Usage: `!automod <invites|spam|mentions|caps|links> <on|off>`")
 
-    if choice == outcome:
-        update_balance(ctx.author.id, bet)
-        add_user_xp(ctx.author.id, 15)
-        embed = discord.Embed(
-            title="🪙 Coinflip — VICTORY!",
-            description=f"The coin landed on **{outcome.upper()}**!\n\n🎉 {ctx.author.mention}, you won **${bet:,}** (+15 XP)!{dice_text}\nNew wallet: **{new_bal}**",
-            color=discord.Color.green()
-        )
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def badword(ctx, action: str, *, word: str):
+    word = word.lower().strip()
+    if action.lower() == "add":
+        c.execute("INSERT OR IGNORE INTO badwords VALUES (?, ?)", (ctx.guild.id, word))
+        conn.commit()
+        await ctx.send(f"🚫 Added `{word}` to the bad-word filter.")
+    elif action.lower() == "remove":
+        c.execute("DELETE FROM badwords WHERE guild_id = ? AND word = ?", (ctx.guild.id, word))
+        conn.commit()
+        await ctx.send(f"✅ Removed `{word}` from the bad-word filter.")
+
+# ==========================================
+# 9. CARL-BOT PREMIUM SUITE (Triggers, Roles, Polls, Starboard, Snipe, Sticky)
+# ==========================================
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def setup(ctx, setting: str, *, target: str):
+    setting = setting.lower()
+    if setting == "prefix":
+        update_config(ctx.guild.id, prefix=target.strip())
+        return await ctx.send(f"✅ Prefix changed to `{target.strip()}`")
+    if setting == "starboard_stars":
+        update_config(ctx.guild.id, starboard_threshold=max(1, int(target.strip())))
+        return await ctx.send(f"⭐ Starboard minimum stars set to **{target.strip()}**.")
+    if setting == "welcomemsg":
+        update_config(ctx.guild.id, welcome_msg=target)
+        return await ctx.send("✅ Updated welcome message! Variables: `{user}`, `{username}`, `{server}`, `{count}`")
+    if setting == "leavemsg":
+        update_config(ctx.guild.id, leave_msg=target)
+        return await ctx.send("✅ Updated leave message!")
+
+    match = re.search(r"\d+", target)
+    if not match:
+        return await ctx.send("Please mention a valid channel or role.")
+    obj_id = int(match.group(0))
+
+    mapping = {
+        "modlog": "modlog_channel",
+        "welcome": "welcome_channel",
+        "leave": "leave_channel",
+        "autorole": "autorole_id",
+        "starboard": "starboard_channel",
+        "jtc": "jtc_channel",
+        "membercount": "membercount_channel"
+    }
+    if setting in mapping:
+        update_config(ctx.guild.id, **{mapping[setting]: obj_id})
+        if setting == "membercount":
+            await update_member_counter(ctx.guild)
+        await ctx.send(f"✅ Updated **{setting}** to <#{obj_id}>" if setting != "autorole" else f"✅ Auto-role set to <@&{obj_id}>")
     else:
-        update_balance(ctx.author.id, -bet)
-        embed = discord.Embed(
-            title="🪙 Coinflip — DEFEAT",
-            description=f"The coin landed on **{outcome.upper()}**!\n\n💀 {ctx.author.mention}, you lost **${bet:,}**.{dice_text}\nNew wallet: **{new_bal}**",
-            color=discord.Color.red()
-        )
+        await ctx.send("Valid settings: `prefix`, `modlog`, `welcome`, `leave`, `welcomemsg`, `leavemsg`, `autorole`, `starboard`, `starboard_stars`, `jtc`, `membercount`")
 
-    await msg.edit(content=None, embed=embed)
+@bot.group(invoke_without_command=True)
+@commands.has_permissions(manage_guild=True)
+async def trigger(ctx):
+    await ctx.send("Usage: `!trigger add <keyword> | <response>`, `!trigger remove <keyword>`, `!trigger list`")
 
-@bot.command(name="slots")
-async def slots(ctx, bet: int):
-    current_bal = get_balance(ctx.author.id)
-    if ctx.author.id not in infinite_money_users and (bet <= 0 or bet > current_bal):
-        return await ctx.send(f"❌ Invalid bet! Your wallet currently has **${current_bal:,}**.")
+@trigger.command(name="add")
+@commands.has_permissions(manage_guild=True)
+async def trigger_add(ctx, *, data: str):
+    if "|" not in data:
+        return await ctx.send("Format: `!trigger add hello | Hey {user}, welcome!`")
+    kw, resp = [x.strip() for x in data.split("|", 1)]
+    c.execute("INSERT OR REPLACE INTO triggers VALUES (?, ?, ?)", (ctx.guild.id, kw.lower(), resp))
+    conn.commit()
+    await ctx.send(f"⚡ Auto-responder trigger added for `{kw.lower()}`!")
 
-    emojis = ["🎰", "🍒", "🍋", "🔔", "💎", "7️⃣"]
+@trigger.command(name="remove")
+@commands.has_permissions(manage_guild=True)
+async def trigger_remove(ctx, *, keyword: str):
+    c.execute("DELETE FROM triggers WHERE guild_id = ? AND keyword = ?", (ctx.guild.id, keyword.lower()))
+    conn.commit()
+    await ctx.send(f"🗑️ Removed trigger `{keyword.lower()}`.")
 
-    msg = await ctx.send("🎰 **Casino Slot Machine**\n`[ ❓ | ❓ | ❓ ]` — *Spinning 1st reel...*")
-    await asyncio.sleep(0.7)
+@trigger.command(name="list")
+async def trigger_list(ctx):
+    c.execute("SELECT keyword FROM triggers WHERE guild_id = ?", (ctx.guild.id,))
+    rows = c.fetchall()
+    if not rows:
+        return await ctx.send("No auto-responder triggers configured.")
+    await ctx.send("⚡ **Active Triggers:** " + ", ".join([f"`{r[0]}`" for r in rows]))
 
-    luck_boost = consume_lucky_dice_boost(ctx.author.id)
-    dice_text = "\n🎲 *(Lucky Dice consumed: +15% Luck)*" if luck_boost > 0 else ""
+@bot.command()
+@commands.has_permissions(manage_roles=True)
+async def addrolebutton(ctx, role: discord.Role, *, label: str):
+    c.execute("INSERT OR REPLACE INTO button_roles VALUES (?, ?, ?)", (ctx.guild.id, role.id, label))
+    conn.commit()
+    await ctx.send(f"✅ Added button **{label}** for role **{role.name}**. Run `!rolepanel` to post the panel!")
 
-    win_threshold = 0.03 + luck_boost
+@bot.command()
+@commands.has_permissions(manage_roles=True)
+async def rolepanel(ctx, *, title="Self-Assignable Roles"):
+    c.execute("SELECT role_id, label FROM button_roles WHERE guild_id = ?", (ctx.guild.id,))
+    rows = c.fetchall()
+    if not rows:
+        return await ctx.send("No role buttons configured! Use `!addrolebutton @Role Label` first.")
+    embed = discord.Embed(title=title, description="Click the buttons below to toggle your roles:", color=discord.Color.blurple())
+    await ctx.send(embed=embed, view=RolePanelView(rows))
 
-    if ctx.author.id in rigged_users:
-        reel1, reel2, reel3 = "7️⃣", "7️⃣", "7️⃣"
-    elif random.random() <= win_threshold:
-        win_symbol = random.choices(["🍒", "🍋", "🔔", "💎", "7️⃣"], weights=[40, 30, 20, 9, 1])[0]
-        reel1, reel2, reel3 = win_symbol, win_symbol, win_symbol
-    else:
-        reel1 = random.choice(emojis)
-        reel2 = random.choice(emojis)
-        reel3 = random.choice(emojis)
-        if random.random() <= 0.15:
-            match_sym = random.choice(emojis)
-            reel1, reel2 = match_sym, match_sym
-            reel3 = "🍒" if match_sym != "🍒" else "🍋"
+@bot.command()
+@commands.has_permissions(manage_roles=True)
+async def reactionrole(ctx, message_id: int, emoji: str, role: discord.Role):
+    msg = await ctx.channel.fetch_message(message_id)
+    await msg.add_reaction(emoji)
+    c.execute("INSERT OR REPLACE INTO emoji_roles VALUES (?, ?, ?, ?)", (ctx.guild.id, message_id, emoji, role.id))
+    conn.commit()
+    await ctx.send(f"✅ Bound {emoji} on message `{message_id}` to **{role.name}**!", delete_after=5)
 
-    await msg.edit(content=f"🎰 **Casino Slot Machine**\n`[ {reel1} | ❓ | ❓ ]` — *Spinning 2nd reel...*")
-    await asyncio.sleep(0.7)
-    await msg.edit(content=f"🎰 **Casino Slot Machine**\n`[ {reel1} | {reel2} | ❓ ]` — *Spinning final reel...*")
-    await asyncio.sleep(0.7)
+@bot.group(invoke_without_command=True)
+async def tag(ctx, *, name: str):
+    c.execute("SELECT content FROM tags WHERE guild_id = ? AND name = ?", (ctx.guild.id, name.lower()))
+    row = c.fetchone()
+    if not row:
+        return await ctx.send("❌ Tag not found.")
+    c.execute("UPDATE tags SET uses = uses + 1 WHERE guild_id = ? AND name = ?", (ctx.guild.id, name.lower()))
+    conn.commit()
+    await ctx.send(format_vars(row[0], member=ctx.author, guild=ctx.guild))
 
-    if reel1 == reel2 == reel3:
-        if reel1 == "7️⃣":
-            winnings = bet * 1000
-            desc = f"🚨 **TRIPLE 7s MEGA JACKPOT!** (1000x)\n🎉 {ctx.author.mention}, you won an unbelievable **${winnings:,}**!"
-            add_user_xp(ctx.author.id, 500)
-        elif reel1 == "💎":
-            winnings = bet * 25
-            desc = f"💎 **DIAMOND JACKPOT!** (25x)\n🎉 {ctx.author.mention}, you won **${winnings:,}**!"
-            add_user_xp(ctx.author.id, 200)
-        else:
-            winnings = bet * 10
-            desc = f"🎉 **TRIPLE JACKPOT!** (10x)\n🎉 {ctx.author.mention}, you won **${winnings:,}**!"
-            add_user_xp(ctx.author.id, 100)
-        update_balance(ctx.author.id, winnings)
-        embed_color = discord.Color.green()
-        title_str = "🎰 Slots — JACKPOT WIN!"
-    elif reel1 == reel2 or reel2 == reel3 or reel1 == reel3:
-        winnings = bet * 3
-        update_balance(ctx.author.id, winnings)
-        add_user_xp(ctx.author.id, 25)
-        desc = f"✨ **Small Win! (2 Matching Emojis)** (3x)\n🎉 {ctx.author.mention}, you won **${winnings:,}** (+25 XP)!"
-        embed_color = discord.Color.gold()
-        title_str = "🎰 Slots — SMALL WIN"
-    else:
-        update_balance(ctx.author.id, -bet)
-        desc = f"❌ {ctx.author.mention}, you lost **${bet:,}**."
-        embed_color = discord.Color.red()
-        title_str = "🎰 Slots — LOSS"
+@tag.command(name="create")
+async def tag_create(ctx, name: str, *, content: str):
+    c.execute("INSERT OR REPLACE INTO tags VALUES (?, ?, ?, ?, 0)", (ctx.guild.id, name.lower(), content, ctx.author.id))
+    conn.commit()
+    await ctx.send(f"✅ Tag `{name.lower()}` saved!")
 
-    new_bal = "∞ (Infinite)" if ctx.author.id in infinite_money_users else f"${get_balance(ctx.author.id):,}"
+@tag.command(name="delete")
+async def tag_delete(ctx, name: str):
+    c.execute("DELETE FROM tags WHERE guild_id = ? AND name = ?", (ctx.guild.id, name.lower()))
+    conn.commit()
+    await ctx.send(f"🗑️ Tag `{name.lower()}` deleted.")
+
+@tag.command(name="list")
+async def tag_list(ctx):
+    c.execute("SELECT name, uses FROM tags WHERE guild_id = ?", (ctx.guild.id,))
+    rows = c.fetchall()
+    if not rows:
+        return await ctx.send("No tags created yet.")
+    await ctx.send("🏷️ **Server Tags:** " + ", ".join([f"`{r[0]}` ({r[1]} uses)" for r in rows]))
+
+@bot.command()
+@commands.has_permissions(manage_messages=True)
+async def sticky(ctx, *, content: str):
+    if content.lower() == "off":
+        update_config(ctx.guild.id, sticky_channel=None, sticky_content=None)
+        return await ctx.send("📌 Sticky message disabled.")
+    msg = await ctx.send(f"📌 **Sticky Message:**\n{content}")
+    update_config(ctx.guild.id, sticky_channel=ctx.channel.id, sticky_content=content, sticky_last_msg=msg.id)
+
+@bot.command()
+async def snipe(ctx):
+    data = sniped_messages.get(ctx.channel.id)
+    if not data:
+        return await ctx.send("Nothing to snipe in this channel!")
+    embed = discord.Embed(description=data["content"], color=discord.Color.red(), timestamp=data["time"])
+    embed.set_author(name=data["author"], icon_url=data["avatar"])
+    await ctx.send(embed=embed)
+
+@bot.command()
+async def editsnipe(ctx):
+    data = edited_messages.get(ctx.channel.id)
+    if not data:
+        return await ctx.send("No recently edited messages to snipe!")
+    embed = discord.Embed(color=discord.Color.gold(), timestamp=data["time"])
+    embed.set_author(name=data["author"], icon_url=data["avatar"])
+    embed.add_field(name="Before", value=data["before"], inline=False)
+    embed.add_field(name="After", value=data["after"], inline=False)
+    await ctx.send(embed=embed)
+
+@bot.command()
+async def poll(ctx, question: str, *options):
+    if len(options) < 2 or len(options) > 9:
+        return await ctx.send('Usage: `!poll "Question?" "Option 1" "Option 2"` (2–9 options)')
+    emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣"]
+    desc = "\n".join([f"{emojis[i]} {opt}" for i, opt in enumerate(options)])
+    embed = discord.Embed(title=f"📊 {question}", description=desc, color=discord.Color.blurple())
+    embed.set_footer(text=f"Poll by {ctx.author.display_name}")
+    msg = await ctx.send(embed=embed)
+    for i in range(len(options)):
+        await msg.add_reaction(emojis[i])
+
+@bot.command()
+@commands.has_permissions(manage_guild=True)
+async def giveaway(ctx, duration: str, *, prize: str):
+    secs = parse_duration(duration)
+    if secs <= 0:
+        return await ctx.send("Invalid duration! Use `30s`, `5m`, `1h`, etc.")
     embed = discord.Embed(
-        title=title_str,
-        description=f"**[ {reel1} | {reel2} | {reel3} ]**\n\n{desc}{dice_text}\nNew wallet: **{new_bal}**",
-        color=embed_color
+        title="🎉 GIVEAWAY 🎉",
+        description=f"**Prize:** {prize}\nReact with 🎉 to enter!\nEnds <t:{int(time.time()) + secs}:R>",
+        color=discord.Color.magenta()
     )
-    await msg.edit(content=None, embed=embed)
+    msg = await ctx.send(embed=embed)
+    await msg.add_reaction("🎉")
+    await asyncio.sleep(secs)
+    msg = await ctx.channel.fetch_message(msg.id)
+    users = [u async for u in msg.reactions[0].users() if not u.bot]
+    if not users:
+        return await ctx.send("No valid entries for the giveaway.")
+    winner = random.choice(users)
+    await ctx.send(f"🎊 Congratulations {winner.mention}! You won **{prize}**!")
 
-@bot.command(name="bj", aliases=["blackjack"])
+@bot.command()
+async def remind(ctx, duration: str, *, text: str):
+    secs = parse_duration(duration)
+    if secs <= 0:
+        return await ctx.send("Invalid time! Use `10m`, `1h`, etc.")
+    await ctx.send(f"⏰ Got it! I will remind you in **{duration}**.")
+    await asyncio.sleep(secs)
+    await ctx.send(f"⏰ {ctx.author.mention}, Reminder: **{text}**")
+
+@bot.command()
+@commands.has_permissions(manage_messages=True)
+async def embed(ctx, title: str, *, description: str):
+    em = discord.Embed(title=title, description=description, color=discord.Color.blurple())
+    await ctx.send(embed=em)
+    await ctx.message.delete()
+
+@bot.command()
+@commands.has_permissions(manage_messages=True)
+async def announce(ctx, channel: discord.TextChannel, *, message: str):
+    em = discord.Embed(title="📢 Announcement", description=message, color=discord.Color.gold())
+    await channel.send(embed=em)
+    await ctx.send(f"✅ Announcement sent to {channel.mention}!", delete_after=4)
+
+@bot.command()
+@commands.has_permissions(manage_messages=True)
+async def schedule(ctx, delay: str, channel: discord.TextChannel, *, message: str):
+    secs = parse_duration(delay)
+    if secs <= 0:
+        return await ctx.send("Invalid delay! Use `5m`, `1h`, etc.")
+    await ctx.send(f"🗓️ Scheduled message for {channel.mention} in **{delay}**.")
+    await asyncio.sleep(secs)
+    await channel.send(message)
+
+@bot.command()
+async def afk(ctx, *, reason="AFK"):
+    afk_users[(ctx.guild.id, ctx.author.id)] = (reason, time.time())
+    await ctx.send(f"💤 {ctx.author.mention} is now AFK: **{reason}**")
+
+@bot.command()
+async def ping(ctx):
+    await ctx.send(f"🏓 Pong! Latency: **{round(bot.latency * 1000)}ms**")
+
+@bot.command(aliases=["av"])
+async def avatar(ctx, member: discord.Member = None):
+    m = member or ctx.author
+    em = discord.Embed(title=f"{m.display_name}'s Avatar", color=m.color)
+    em.set_image(url=m.display_avatar.url)
+    await ctx.send(embed=em)
+
+@bot.command()
+async def serverinfo(ctx):
+    g = ctx.guild
+    em = discord.Embed(title=g.name, color=discord.Color.blurple())
+    if g.icon:
+        em.set_thumbnail(url=g.icon.url)
+    em.add_field(name="Owner", value=str(g.owner))
+    em.add_field(name="Members", value=str(g.member_count))
+    em.add_field(name="Channels", value=str(len(g.channels)))
+    em.add_field(name="Roles", value=str(len(g.roles)))
+    await ctx.send(embed=em)
+
+@bot.command()
+async def userinfo(ctx, member: discord.Member = None):
+    m = member or ctx.author
+    em = discord.Embed(title=str(m), color=m.color)
+    em.set_thumbnail(url=m.display_avatar.url)
+    em.add_field(name="ID", value=str(m.id))
+    em.add_field(name="Joined Server", value=f"<t:{int(m.joined_at.timestamp())}:R>")
+    em.add_field(name="Account Created", value=f"<t:{int(m.created_at.timestamp())}:R>")
+    await ctx.send(embed=em)
+
+@bot.command()
+async def roleinfo(ctx, role: discord.Role):
+    em = discord.Embed(title=f"Role: {role.name}", color=role.color)
+    em.add_field(name="ID", value=str(role.id))
+    em.add_field(name="Members", value=str(len(role.members)))
+    em.add_field(name="Mentionable", value=str(role.mentionable))
+    await ctx.send(embed=em)
+
+# ==========================================
+# 10. ECONOMY & CASINO COMMANDS (#casino ONLY)
+# ==========================================
+@bot.command(aliases=["bal"])
+async def balance(ctx, member: discord.Member = None):
+    m = member or ctx.author
+    ud = get_user_data(ctx.guild.id, m.id)
+    em = discord.Embed(title=f"💰 {m.display_name}'s Finances", color=discord.Color.green())
+    em.add_field(name="Wallet", value=f"${ud['balance']:,}")
+    em.add_field(name="Bank", value=f"${ud['bank']:,}")
+    em.add_field(name="Bounty", value=f"${ud['bounty']:,}")
+    await ctx.send(embed=em)
+
+@bot.command()
+async def daily(ctx):
+    ud = get_user_data(ctx.guild.id, ctx.author.id)
+    now = int(time.time())
+    if now - ud["last_daily"] < 86400:
+        rem = 86400 - (now - ud["last_daily"])
+        return await ctx.send(f"⏳ Come back in **{rem // 3600}h {(rem % 3600) // 60}m** for your next daily reward!")
+    reward = random.randint(500, 1000)
+    update_user_data(ctx.guild.id, ctx.author.id, balance=ud["balance"] + reward, last_daily=now)
+    await ctx.send(f"💵 You claimed your daily reward of **${reward:,}**!")
+
+@bot.command()
+async def work(ctx):
+    ud = get_user_data(ctx.guild.id, ctx.author.id)
+    now = int(time.time())
+    if now - ud["last_work"] < 1800:
+        rem = 1800 - (now - ud["last_work"])
+        return await ctx.send(f"⏳ You can work again in **{rem // 60}m {rem % 60}s**.")
+    jobs = ["coded a Discord bot", "fixed a server outage", "worked a shift at the casino", "won a local tournament"]
+    earned = random.randint(150, 450)
+    update_user_data(ctx.guild.id, ctx.author.id, balance=ud["balance"] + earned, last_work=now)
+    await ctx.send(f"💼 You {random.choice(jobs)} and earned **${earned:,}**!")
+
+@bot.command()
+async def crime(ctx):
+    ud = get_user_data(ctx.guild.id, ctx.author.id)
+    now = int(time.time())
+    if now - ud["last_crime"] < 3600:
+        rem = 3600 - (now - ud["last_crime"])
+        return await ctx.send(f"⏳ Lay low for **{rem // 60}m {rem % 60}s** before committing another crime.")
+    c.execute("SELECT quantity FROM inventory WHERE guild_id = ? AND user_id = ? AND item_name = 'Lucky Coin'", (ctx.guild.id, ctx.author.id))
+    has_coin = (c.fetchone() or [0])[0] > 0
+    chance = 0.60 if has_coin else 0.45
+    if random.random() < chance:
+        loot = random.randint(400, 1200)
+        update_user_data(ctx.guild.id, ctx.author.id, balance=ud["balance"] + loot, last_crime=now)
+        await ctx.send(f"🕵️ Heist succeeded! You got away with **${loot:,}**!")
+    else:
+        fine = min(ud["balance"], random.randint(200, 500))
+        update_user_data(ctx.guild.id, ctx.author.id, balance=ud["balance"] - fine, last_crime=now)
+        await ctx.send(f"🚓 Busted! You paid a **${fine:,}** fine.")
+
+@bot.command(aliases=["dep"])
+async def deposit(ctx, amount: str):
+    ud = get_user_data(ctx.guild.id, ctx.author.id)
+    if amount.lower() == "all":
+        amt = ud["balance"]
+    elif amount.isdigit():
+        amt = int(amount)
+    else:
+        return await ctx.send("❌ Enter a valid number or `all`.")
+    if amt <= 0 or amt > ud["balance"]:
+        return await ctx.send("❌ Invalid deposit amount.")
+    update_user_data(ctx.guild.id, ctx.author.id, balance=ud["balance"] - amt, bank=ud["bank"] + amt)
+    await ctx.send(f"🏦 Deposited **${amt:,}** into your bank.")
+
+@bot.command(aliases=["with"])
+async def withdraw(ctx, amount: str):
+    ud = get_user_data(ctx.guild.id, ctx.author.id)
+    if amount.lower() == "all":
+        amt = ud["bank"]
+    elif amount.isdigit():
+        amt = int(amount)
+    else:
+        return await ctx.send("❌ Enter a valid number or `all`.")
+    if amt <= 0 or amt > ud["bank"]:
+        return await ctx.send("❌ Invalid withdrawal amount.")
+    update_user_data(ctx.guild.id, ctx.author.id, balance=ud["balance"] + amt, bank=ud["bank"] - amt)
+    await ctx.send(f"💵 Withdrew **${amt:,}** to your wallet.")
+
+@bot.command(aliases=["pay"])
+async def give(ctx, member: discord.Member, amount: int):
+    if member.id == ctx.author.id or amount <= 0:
+        return await ctx.send("❌ Invalid transfer.")
+    sender = get_user_data(ctx.guild.id, ctx.author.id)
+    if sender["balance"] < amount:
+        return await ctx.send("❌ Insufficient funds in your wallet.")
+    receiver = get_user_data(ctx.guild.id, member.id)
+    update_user_data(ctx.guild.id, ctx.author.id, balance=sender["balance"] - amount)
+    update_user_data(ctx.guild.id, member.id, balance=receiver["balance"] + amount)
+    await ctx.send(f"💸 Sent **${amount:,}** to **{member.display_name}**!")
+
+@bot.command()
+async def slots(ctx, bet: int):
+    ud = get_user_data(ctx.guild.id, ctx.author.id)
+    if bet <= 0 or bet > ud["balance"]:
+        return await ctx.send("❌ Invalid bet amount.")
+    emojis = ["🍒", "🍋", "🍇", "🔔", "💎", "7️⃣"]
+    msg = await ctx.send("🎰 Spinning... | ❓ | ❓ | ❓ |")
+    await asyncio.sleep(1.2)
+    r = [random.choice(emojis) for _ in range(3)]
+    if r[0] == r[1] == r[2]:
+        mult = 10 if r[0] == "7️⃣" else 5
+        win = bet * mult
+        update_user_data(ctx.guild.id, ctx.author.id, balance=ud["balance"] + win)
+        await msg.edit(content=f"🎰 | {r[0]} | {r[1]} | {r[2]} |\n🎉 **JACKPOT!** You won **${win:,}**!")
+    elif r[0] == r[1] or r[1] == r[2] or r[0] == r[2]:
+        win = int(bet * 1.5)
+        update_user_data(ctx.guild.id, ctx.author.id, balance=ud["balance"] + (win - bet))
+        await msg.edit(content=f"🎰 | {r[0]} | {r[1]} | {r[2]} |\n✨ Two matched! You won **${win:,}**!")
+    else:
+        update_user_data(ctx.guild.id, ctx.author.id, balance=ud["balance"] - bet)
+        await msg.edit(content=f"🎰 | {r[0]} | {r[1]} | {r[2]} |\n💀 You lost **${bet:,}**.")
+
+@bot.command(aliases=["cf"])
+async def coinflip(ctx, side: str, bet: int):
+    side = side.lower()
+    if side not in ("heads", "tails", "h", "t"):
+        return await ctx.send("Choose `heads` or `tails`! Example: `!cf heads 100`")
+    choice = "heads" if side in ("heads", "h") else "tails"
+    ud = get_user_data(ctx.guild.id, ctx.author.id)
+    if bet <= 0 or bet > ud["balance"]:
+        return await ctx.send("❌ Invalid bet amount.")
+    result = random.choice(["heads", "tails"])
+    if choice == result:
+        update_user_data(ctx.guild.id, ctx.author.id, balance=ud["balance"] + bet)
+        await ctx.send(f"🪙 Landed on **{result.upper()}**! You won **${bet:,}**!")
+    else:
+        update_user_data(ctx.guild.id, ctx.author.id, balance=ud["balance"] - bet)
+        await ctx.send(f"🪙 Landed on **{result.upper()}**! You lost **${bet:,}**.")
+
+@bot.command()
+async def roulette(ctx, color: str, bet: int):
+    color = color.lower()
+    if color not in ("red", "black", "green"):
+        return await ctx.send("Choose `red`, `black`, or `green`! Example: `!roulette red 200`")
+    ud = get_user_data(ctx.guild.id, ctx.author.id)
+    if bet <= 0 or bet > ud["balance"]:
+        return await ctx.send("❌ Invalid bet amount.")
+    roll = random.choices(["red", "black", "green"], weights=[48, 48, 4])[0]
+    if color == roll:
+        mult = 14 if roll == "green" else 2
+        win = bet * mult
+        update_user_data(ctx.guild.id, ctx.author.id, balance=ud["balance"] + (win - bet))
+        await ctx.send(f"🎡 The ball landed on **{roll.upper()}**! You won **${win:,}**!")
+    else:
+        update_user_data(ctx.guild.id, ctx.author.id, balance=ud["balance"] - bet)
+        await ctx.send(f"🎡 The ball landed on **{roll.upper()}**! You lost **${bet:,}**.")
+
+@bot.command(aliases=["bj"])
 async def blackjack(ctx, bet: int):
-    current_bal = get_balance(ctx.author.id)
-    if ctx.author.id not in infinite_money_users and (bet <= 0 or bet > current_bal):
-        return await ctx.send(f"❌ Invalid bet! Your wallet currently has **${current_bal:,}**.")
+    ud = get_user_data(ctx.guild.id, ctx.author.id)
+    if bet <= 0 or bet > ud["balance"]:
+        return await ctx.send("❌ Invalid bet amount.")
+    deck = [2, 3, 4, 5, 6, 7, 8, 9, 10, 10, 10, 10, 11] * 4
+    random.shuffle(deck)
+    player = [deck.pop(), deck.pop()]
+    dealer = [deck.pop(), deck.pop()]
 
-    msg = await ctx.send("🃏 **Blackjack Table**\n`[ 🎴 Shuffling deck... ]`")
-    await asyncio.sleep(0.6)
-    await msg.edit(content="🃏 **Blackjack Table**\n`[ 🎴 Dealing cards to players... ]`")
-    await asyncio.sleep(0.6)
-    await msg.edit(content="🃏 **Blackjack Table**\n`[ 🏛️ Dealer revealing house hand... ]`")
-    await asyncio.sleep(0.6)
+    def score(hand):
+        s = sum(hand)
+        aces = hand.count(11)
+        while s > 21 and aces:
+            s -= 10
+            aces -= 1
+        return s
 
-    luck_boost = consume_lucky_dice_boost(ctx.author.id)
-    dice_text = "\n🎲 *(Lucky Dice consumed: +15% Luck)*" if luck_boost > 0 else ""
+    await ctx.send(f"🃏 **Blackjack** | Your hand: `{player}` (**{score(player)}**) | Dealer shows: `{dealer[0]}`\nType `hit` or `stand`.")
 
-    if ctx.author.id in rigged_users:
-        player_score = 21
-        dealer_score = random.randint(17, 20)
-    else:
-        player_score = random.randint(15, 21)
-        dealer_score = random.randint(15, 21)
-        if luck_boost > 0 and random.random() <= luck_boost:
-            player_score = 21
+    def check(m):
+        return m.author == ctx.author and m.channel == ctx.channel and m.content.lower() in ("hit", "stand")
 
-    new_bal = "∞ (Infinite)" if ctx.author.id in infinite_money_users else f"${get_balance(ctx.author.id):,}"
-
-    if player_score > dealer_score:
-        update_balance(ctx.author.id, bet)
-        add_user_xp(ctx.author.id, 20)
-        embed = discord.Embed(
-            title="🃏 Blackjack — YOU WON!",
-            description=f"Your Score: **{player_score}** | Dealer Score: **{dealer_score}**\n\n🎉 {ctx.author.mention}, you won **${bet:,}** (+20 XP)!{dice_text}\nWallet: **{new_bal}**",
-            color=discord.Color.green()
-        )
-    elif player_score < dealer_score:
-        update_balance(ctx.author.id, -bet)
-        embed = discord.Embed(
-            title="🃏 Blackjack — YOU LOST",
-            description=f"Your Score: **{player_score}** | Dealer Score: **{dealer_score}**\n\n💀 {ctx.author.mention}, you lost **${bet:,}**.{dice_text}\nWallet: **{new_bal}**",
-            color=discord.Color.red()
-        )
-    else:
-        embed = discord.Embed(
-            title="🃏 Blackjack — PUSH (TIE)",
-            description=f"Both got **{player_score}**. Your bet of **${bet:,}** was returned.{dice_text}",
-            color=discord.Color.gold()
-        )
-
-    await msg.edit(content=None, embed=embed)
-
-@bot.command(name="roulette")
-async def roulette(ctx, bet: int, choice: str):
-    choice = choice.lower()
-    if choice not in ["red", "black", "green"]:
-        return await ctx.send("❌ Pick `red`, `black`, or `green`. Example: `!roulette 100 red`")
-
-    current_bal = get_balance(ctx.author.id)
-    if ctx.author.id not in infinite_money_users and (bet <= 0 or bet > current_bal):
-        return await ctx.send(f"❌ Invalid bet! Your wallet currently has **${current_bal:,}**.")
-
-    msg = await ctx.send("🎡 **Roulette Wheel**\n`[ 🔴 Spinning wheel... ]`")
-    await asyncio.sleep(0.6)
-    await msg.edit(content="🎡 **Roulette Wheel**\n`[ ⚫ Ball speeding across slots... ]`")
-    await asyncio.sleep(0.6)
-    await msg.edit(content="🎡 **Roulette Wheel**\n`[ 🟢 Ball slowing down... ]`")
-    await asyncio.sleep(0.6)
-
-    luck_boost = consume_lucky_dice_boost(ctx.author.id)
-    dice_text = "\n🎲 *(Lucky Dice consumed: +15% Luck)*" if luck_boost > 0 else ""
-
-    if ctx.author.id in rigged_users:
-        spin = choice
-    else:
-        if luck_boost > 0 and random.random() <= luck_boost:
-            spin = choice
+    while score(player) < 21:
+        try:
+            reply = await bot.wait_for("message", timeout=25.0, check=check)
+        except asyncio.TimeoutError:
+            break
+        if reply.content.lower() == "hit":
+            player.append(deck.pop())
+            if score(player) > 21:
+                update_user_data(ctx.guild.id, ctx.author.id, balance=ud["balance"] - bet)
+                return await ctx.send(f"💥 Bust! Your hand: `{player}` (**{score(player)}**). You lost **${bet:,}**.")
+            await ctx.send(f"🃏 Your hand: `{player}` (**{score(player)}**). `hit` or `stand`?")
         else:
-            spin = random.choices(["red", "black", "green"], weights=[47.3, 47.3, 5.4])[0]
+            break
 
-    new_bal = "∞ (Infinite)" if ctx.author.id in infinite_money_users else f"${get_balance(ctx.author.id):,}"
+    while score(dealer) < 17:
+        dealer.append(deck.pop())
 
-    if choice == spin:
-        multiplier = 14 if choice == "green" else 2
-        winnings = bet * multiplier
-        update_balance(ctx.author.id, winnings)
-        add_user_xp(ctx.author.id, 25)
-        embed = discord.Embed(
-            title="🎡 Roulette — WIN!",
-            description=f"The ball landed on **{spin.upper()}**!\n\n🎉 {ctx.author.mention}, you won **${winnings:,}** (+25 XP)!{dice_text}\nWallet: **{new_bal}**",
-            color=discord.Color.green()
-        )
+    ps, ds = score(player), score(dealer)
+    if ds > 21 or ps > ds:
+        update_user_data(ctx.guild.id, ctx.author.id, balance=ud["balance"] + bet)
+        await ctx.send(f"🎉 You win! You: **{ps}** | Dealer: `{dealer}` (**{ds}**). Won **${bet:,}**!")
+    elif ps < ds:
+        update_user_data(ctx.guild.id, ctx.author.id, balance=ud["balance"] - bet)
+        await ctx.send(f"💀 Dealer wins! You: **{ps}** | Dealer: `{dealer}` (**{ds}**). Lost **${bet:,}**.")
     else:
-        update_balance(ctx.author.id, -bet)
-        embed = discord.Embed(
-            title="🎡 Roulette — LOSS",
-            description=f"The ball landed on **{spin.upper()}**!\n\n💀 {ctx.author.mention}, you lost **${bet:,}**.{dice_text}\nWallet: **{new_bal}**",
-            color=discord.Color.red()
-        )
+        await ctx.send(f"🤝 Push (Tie)! Both had **{ps}**.")
 
-    await msg.edit(content=None, embed=embed)
+@bot.command()
+async def rob(ctx, target: discord.Member):
+    if target.id == ctx.author.id:
+        return await ctx.send("You can't rob yourself.")
+    robber = get_user_data(ctx.guild.id, ctx.author.id)
+    victim = get_user_data(ctx.guild.id, target.id)
+    if victim["balance"] < 200 and victim["bounty"] <= 0:
+        return await ctx.send("They don't have enough cash or a bounty worth robbing!")
 
-@bot.command(name="poker")
-async def poker(ctx, bet: int):
-    current_bal = get_balance(ctx.author.id)
-    if ctx.author.id not in infinite_money_users and (bet <= 0 or bet > current_bal):
-        return await ctx.send(f"❌ Invalid bet! Your wallet currently has **${current_bal:,}**.")
+    c.execute("SELECT quantity FROM inventory WHERE guild_id = ? AND user_id = ? AND item_name = 'Padlock'", (ctx.guild.id, target.id))
+    lock_row = c.fetchone()
+    if lock_row and lock_row[0] > 0:
+        c.execute("UPDATE inventory SET quantity = quantity - 1 WHERE guild_id = ? AND user_id = ? AND item_name = 'Padlock'", (ctx.guild.id, target.id))
+        conn.commit()
+        return await ctx.send(f"🔒 **{target.display_name}** had a **Padlock**! Your robbery failed and broke their lock.")
 
-    msg = await ctx.send("♠️ **Poker Table**\n`[ 🎴 Dealing pocket cards... ]`")
-    await asyncio.sleep(0.6)
-    await msg.edit(content="♠️ **Poker Table**\n`[ 🃏 Revealing the flop and turn... ]`")
-    await asyncio.sleep(0.6)
-    await msg.edit(content="♠️ **Poker Table**\n`[ 🃏 Dealing the final river card... ]`")
-    await asyncio.sleep(0.6)
+    c.execute("SELECT quantity FROM inventory WHERE guild_id = ? AND user_id = ? AND item_name = 'Lucky Coin'", (ctx.guild.id, ctx.author.id))
+    has_coin = (c.fetchone() or [0])[0] > 0
+    chance = 0.55 if has_coin else 0.45
 
-    luck_boost = consume_lucky_dice_boost(ctx.author.id)
-    dice_text = "\n🎲 *(Lucky Dice consumed: +15% Luck)*" if luck_boost > 0 else ""
-
-    hands = ["High Card", "Pair", "Two Pair", "Three of a Kind", "Straight", "Flush", "Full House"]
-    weights = [35, 30, 15, 10, 5, 3, 2]
-    
-    if ctx.author.id in rigged_users:
-        player_hand = "Full House"
-        dealer_hand = "Pair"
+    if random.random() < chance:
+        stolen = random.randint(50, max(50, int(victim["balance"] * 0.4))) if victim["balance"] >= 200 else 0
+        bounty_payout = victim["bounty"]
+        total_gain = stolen + bounty_payout
+        update_user_data(ctx.guild.id, ctx.author.id, balance=robber["balance"] + total_gain)
+        update_user_data(ctx.guild.id, target.id, balance=victim["balance"] - stolen, bounty=0)
+        bounty_txt = f" + **${bounty_payout:,}** bounty claimed!" if bounty_payout > 0 else "!"
+        await ctx.send(f"🦹 You robbed **${stolen:,}** from **{target.display_name}**{bounty_txt}")
     else:
-        player_hand = random.choices(hands, weights=weights)[0]
-        dealer_hand = random.choices(hands, weights=weights)[0]
-        if luck_boost > 0 and random.random() <= luck_boost:
-            player_hand = "Full House"
-    
-    rank = {h: i for i, h in enumerate(hands)}
-    new_bal = "∞ (Infinite)" if ctx.author.id in infinite_money_users else f"${get_balance(ctx.author.id):,}"
+        fine = min(robber["balance"], 250)
+        update_user_data(ctx.guild.id, ctx.author.id, balance=robber["balance"] - fine)
+        await ctx.send(f"🚓 You got caught and paid a **${fine:,}** fine!")
 
-    if rank[player_hand] > rank[dealer_hand]:
-        winnings = bet * 2
-        update_balance(ctx.author.id, winnings)
-        add_user_xp(ctx.author.id, 30)
-        embed = discord.Embed(
-            title="♠️ Poker — YOU WON!",
-            description=f"Your Hand: **{player_hand}** | Dealer: **{dealer_hand}**\n\n🎉 {ctx.author.mention}, you won **${winnings:,}** (+30 XP)!{dice_text}\nWallet: **{new_bal}**",
-            color=discord.Color.green()
-        )
-    elif rank[player_hand] < rank[dealer_hand]:
-        update_balance(ctx.author.id, -bet)
-        embed = discord.Embed(
-            title="♠️ Poker — YOU LOST",
-            description=f"Your Hand: **{player_hand}** | Dealer: **{dealer_hand}**\n\n💀 {ctx.author.mention}, you lost **${bet:,}**.{dice_text}\nWallet: **{new_bal}**",
-            color=discord.Color.red()
-        )
+@bot.command()
+async def bounty(ctx, target: discord.Member, amount: int):
+    ud = get_user_data(ctx.guild.id, ctx.author.id)
+    if amount <= 0 or ud["balance"] < amount:
+        return await ctx.send("❌ Insufficient wallet funds.")
+    td = get_user_data(ctx.guild.id, target.id)
+    update_user_data(ctx.guild.id, ctx.author.id, balance=ud["balance"] - amount)
+    update_user_data(ctx.guild.id, target.id, bounty=td["bounty"] + amount)
+    await ctx.send(f"🎯 Placed a **${amount:,}** bounty on **{target.display_name}**! (Rob them to claim it)")
+
+@bot.command()
+async def shop(ctx):
+    em = discord.Embed(title="🛒 Server Shop", color=discord.Color.gold())
+    for name, info in SHOP_ITEMS.items():
+        em.add_field(name=f"{name} — ${info['price']:,}", value=info["desc"], inline=False)
+    em.set_footer(text="Buy an item with !buy <item name>")
+    await ctx.send(embed=em)
+
+@bot.command()
+async def buy(ctx, *, item_name: str):
+    matched = next((k for k in SHOP_ITEMS if k.lower() == item_name.lower()), None)
+    if not matched:
+        return await ctx.send("❌ Item not found in shop.")
+    price = SHOP_ITEMS[matched]["price"]
+    ud = get_user_data(ctx.guild.id, ctx.author.id)
+    if ud["balance"] < price:
+        return await ctx.send("❌ You don't have enough cash in your wallet.")
+    update_user_data(ctx.guild.id, ctx.author.id, balance=ud["balance"] - price)
+    c.execute("INSERT INTO inventory VALUES (?, ?, ?, 1) ON CONFLICT(guild_id, user_id, item_name) DO UPDATE SET quantity = quantity + 1",
+              (ctx.guild.id, ctx.author.id, matched))
+    conn.commit()
+    await ctx.send(f"🛍️ Purchased **{matched}** for **${price:,}**!")
+
+@bot.command(aliases=["inv"])
+async def inventory(ctx):
+    c.execute("SELECT item_name, quantity FROM inventory WHERE guild_id = ? AND user_id = ? AND quantity > 0", (ctx.guild.id, ctx.author.id))
+    rows = c.fetchall()
+    if not rows:
+        return await ctx.send("🎒 Your inventory is empty.")
+    desc = "\n".join([f"• **{r[0]}** x{r[1]}" for r in rows])
+    await ctx.send(embed=discord.Embed(title=f"🎒 {ctx.author.display_name}'s Inventory", description=desc, color=discord.Color.blurple()))
+
+@bot.command()
+async def openbox(ctx):
+    c.execute("SELECT quantity FROM inventory WHERE guild_id = ? AND user_id = ? AND item_name = 'Mystery Box'", (ctx.guild.id, ctx.author.id))
+    row = c.fetchone()
+    if not row or row[0] <= 0:
+        return await ctx.send("📦 You don't have any Mystery Boxes! Buy one from `!shop`.")
+    c.execute("UPDATE inventory SET quantity = quantity - 1 WHERE guild_id = ? AND user_id = ? AND item_name = 'Mystery Box'", (ctx.guild.id, ctx.author.id))
+    conn.commit()
+    prize = random.randint(500, 4000)
+    ud = get_user_data(ctx.guild.id, ctx.author.id)
+    update_user_data(ctx.guild.id, ctx.author.id, balance=ud["balance"] + prize)
+    await ctx.send(f"🎁 You opened a **Mystery Box** and found **${prize:,}**!")
+
+@bot.command(aliases=["lb"])
+async def leaderboard(ctx):
+    c.execute("SELECT user_id, (balance + bank) as net FROM users WHERE guild_id = ? ORDER BY net DESC LIMIT 10", (ctx.guild.id,))
+    rows = c.fetchall()
+    desc = "\n".join([f"**#{i+1}** <@{r[0]}> — **${r[1]:,}**" for i, r in enumerate(rows)])
+    await ctx.send(embed=discord.Embed(title="🏆 Richest Players", description=desc or "No data yet.", color=discord.Color.gold()))
+
+@bot.command(aliases=["level"])
+async def rank(ctx, member: discord.Member = None):
+    m = member or ctx.author
+    ud = get_user_data(ctx.guild.id, m.id)
+    await ctx.send(f"📊 **{m.display_name}** is **Level {ud['level']}** ({ud['xp']}/{ud['level']*150} XP)")
+
+# ==========================================
+# 11. HELP COMMAND
+# ==========================================
+@bot.command()
+async def help(ctx):
+    em = discord.Embed(title="🤖 Bot Command Directory", color=discord.Color.blurple())
+    em.add_field(
+        name="🚨 Lockdown & Moderation (Dyno + Premium)",
+        value="`!lockdown`, `!unlockdown`, `!lockdownignore`, `!kick`, `!ban`, `!tempban`, `!unban`, `!mute`, `!unmute`, `!warn`, `!warnings`, `!clearwarns`, `!note`, `!notes`, `!purge`, `!autopurge`, `!slowmode`, `!lock`, `!unlock`, `!nuke`, `!nick`, `!role`, `!massrole`, `!vcmove`, `!automod`, `!badword`",
+        inline=False
+    )
+    em.add_field(
+        name="⚙️ Utilities, Panels & Automation (Carl-bot + Premium)",
+        value="`!setup`, `!trigger`, `!addrolebutton`, `!rolepanel`, `!reactionrole`, `!tag`, `!sticky`, `!snipe`, `!editsnipe`, `!poll`, `!giveaway`, `!remind`, `!embed`, `!announce`, `!schedule`, `!afk`, `!ping`, `!avatar`, `!serverinfo`, `!userinfo`, `!roleinfo`",
+        inline=False
+    )
+    em.add_field(
+        name="🎰 Economy & Casino (#casino only)",
+        value="`!balance`, `!daily`, `!work`, `!crime`, `!deposit`, `!withdraw`, `!give`, `!slots`, `!coinflip`, `!roulette`, `!blackjack`, `!rob`, `!bounty`, `!shop`, `!buy`, `!inventory`, `!openbox`, `!leaderboard`, `!rank`",
+        inline=False
+    )
+    await ctx.send(embed=em)
+
+# ==========================================
+# 12. START BOT
+# ==========================================
+if __name__ == "__main__":
+    keep_alive()
+    token = os.environ.get("DISCORD_TOKEN")
+    if not token:
+        print("ERROR: DISCORD_TOKEN environment variable not set!")
     else:
-        embed = discord.Embed(
-            title="♠️ Poker — SPLIT POT",
-            description=f"Both had **{player_hand}**. Bet of **${bet:,}** returned.{dice_text}",
-            color=discord.Color.gold()
-        )
-
-    await msg.edit(content=None, embed=embed)
-
-# 6. Run your bot
-TOKEN = os.environ.get("DISCORD_TOKEN")
-bot.run(TOKEN)
+        bot.run(token)
