@@ -1547,26 +1547,61 @@ async def rank(ctx, member: discord.Member = None):
     await ctx.send(f"📊 **{m.display_name}** is **Level {ud['level']}** ({ud['xp']}/{ud['level']*150} XP)")
 
 # ==========================================
-# 11. HELP COMMAND
+# 11. HELP COMMAND (Role-Based UI)
 # ==========================================
 @bot.command()
 async def help(ctx):
-    em = discord.Embed(title="🤖 Bot Command Directory", color=discord.Color.blurple())
-    em.add_field(
-        name="🚨 Lockdown & Moderation (Dyno + Premium)",
-        value="`!lockdown`, `!unlockdown`, `!lockdownignore`, `!kick`, `!ban`, `!tempban`, `!unban`, `!mute`, `!unmute`, `!warn`, `!warnings`, `!clearwarns`, `!note`, `!notes`, `!purge`, `!autopurge`, `!slowmode`, `!lock`, `!unlock`, `!nuke`, `!nick`, `!role`, `!massrole`, `!vcmove`, `!automod`, `!badword`",
-        inline=False
-    )
-    em.add_field(
-        name="⚙️ Utilities, Panels & Automation (Carl-bot + Premium)",
-        value="`!setup`, `!trigger`, `!addrolebutton`, `!rolepanel`, `!reactionrole`, `!tag`, `!sticky`, `!snipe`, `!editsnipe`, `!poll`, `!giveaway`, `!remind`, `!embed`, `!announce`, `!schedule`, `!afk`, `!ping`, `!avatar`, `!serverinfo`, `!userinfo`, `!roleinfo`",
-        inline=False
-    )
-    em.add_field(
-        name="🎰 Economy & Casino (#casino only)",
-        value="`!balance`, `!daily`, `!work`, `!crime`, `!deposit`, `!withdraw`, `!give`, `!slots`, `!coinflip`, `!roulette`, `!blackjack`, `!rob`, `!bounty`, `!shop`, `!buy`, `!inventory`, `!openbox`, `!leaderboard`, `!rank`",
-        inline=False
-    )
+    is_owner = any(role.name.lower() == "kratos the owner" for role in ctx.author.roles)
+
+    if is_owner:
+        em = discord.Embed(
+            title="👑 Owner & Admin Command Directory",
+            description="Full server control, moderation, automation, and casino commands.",
+            color=discord.Color.gold()
+        )
+        em.add_field(
+            name="🚨 Lockdown & Moderation (Dyno + Premium)",
+            value="`!lockdown`, `!unlockdown`, `!lockdownignore`, `!kick`, `!ban`, `!tempban`, `!unban`, `!mute`, `!unmute`, `!warn`, `!warnings`, `!clearwarns`, `!note`, `!notes`, `!purge`, `!autopurge`, `!slowmode`, `!lock`, `!unlock`, `!nuke`, `!nick`, `!role`, `!massrole`, `!vcmove`, `!automod`, `!badword`",
+            inline=False
+        )
+        em.add_field(
+            name="⚙️ Utilities, Panels & Automation (Carl-bot + Premium)",
+            value="`!setup`, `!trigger`, `!addrolebutton`, `!rolepanel`, `!reactionrole`, `!tag`, `!sticky`, `!snipe`, `!editsnipe`, `!poll`, `!giveaway`, `!remind`, `!embed`, `!announce`, `!schedule`, `!afk`, `!ping`, `!avatar`, `!serverinfo`, `!userinfo`, `!roleinfo`",
+            inline=False
+        )
+        em.add_field(
+            name="🎰 Economy & Casino (#casino only)",
+            value="`!balance`, `!daily`, `!work`, `!crime`, `!deposit`, `!withdraw`, `!give`, `!slots`, `!coinflip`, `!roulette`, `!blackjack`, `!rob`, `!bounty`, `!shop`, `!buy`, `!inventory`, `!openbox`, `!leaderboard`, `!rank`",
+            inline=False
+        )
+        em.set_footer(text="Visible only to KRATOS THE OWNER")
+    else:
+        em = discord.Embed(
+            title="🎰 Casino & Player Commands",
+            description="Use all economy and gambling commands inside **#casino**!",
+            color=discord.Color.blurple()
+        )
+        em.add_field(
+            name="💵 Money & Banking",
+            value="`!balance` (`!bal`), `!daily`, `!work`, `!crime`, `!deposit` (`!dep`), `!withdraw` (`!with`), `!give` (`!pay`)",
+            inline=False
+        )
+        em.add_field(
+            name="🎲 Casino Games",
+            value="`!slots <bet>`, `!coinflip <heads|tails> <bet>`, `!roulette <red|black|green> <bet>`, `!blackjack <bet>`",
+            inline=False
+        )
+        em.add_field(
+            name="🛒 Shop, PvP & Progression",
+            value="`!shop`, `!buy <item>`, `!inventory` (`!inv`), `!openbox`, `!rob @user`, `!bounty @user <amount>`, `!leaderboard` (`!lb`), `!rank`",
+            inline=False
+        )
+        em.add_field(
+            name="🛠️ General Utilities",
+            value="`!afk`, `!remind`, `!poll`, `!tag`, `!snipe`, `!editsnipe`, `!avatar`, `!userinfo`, `!serverinfo`, `!ping`",
+            inline=False
+        )
+
     await ctx.send(embed=em)
 
 # ==========================================
