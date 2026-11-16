@@ -8,7 +8,7 @@ import datetime
 from threading import Thread
 from flask import Flask
 import discord
-from discord.ext import commands, tasks
+from discord.ext import commands
 
 # ==========================================
 # 1. RENDER KEEP-ALIVE WEB SERVER
@@ -201,12 +201,11 @@ def get_prefix(bot, message):
 
 bot = commands.Bot(command_prefix=get_prefix, intents=intents, help_command=None)
 
-# Runtime caches
-sniped_messages = {}       # channel_id -> dict
-edited_messages = {}       # channel_id -> dict
-afk_users = {}             # (guild_id, user_id) -> (reason, timestamp)
-spam_tracker = {}          # (guild_id, user_id) -> list of timestamps
-xp_cooldowns = {}          # (guild_id, user_id) -> last_xp_time
+sniped_messages = {}
+edited_messages = {}
+afk_users = {}
+spam_tracker = {}
+xp_cooldowns = {}
 temp_voice_channels = set()
 
 SHOP_ITEMS = {
@@ -214,7 +213,7 @@ SHOP_ITEMS = {
     "Padlock": {"price": 1000, "desc": "Protects your wallet from one robbery attempt."},
     "Lucky Coin": {"price": 2500, "desc": "Boosts crime & rob luck slightly."},
     "Bank Expansion": {"price": 3000, "desc": "A prestige item for top earners."},
-    "Mystery Box": {"price": 1500, "desc": "Use !openbox for a random cash reward!"}
+    "Mystery Box": {"price": 1500, "desc": "Use !openbox for a suspenseful cash reveal!"}
 }
 
 def parse_duration(duration_str: str) -> int:
@@ -255,7 +254,7 @@ async def update_member_counter(guild: discord.Guild):
                 pass
 
 # ==========================================
-# 4. PERSISTENT BUTTON ROLES (Carl-bot Style)
+# 4. PERSISTENT BUTTON ROLES & BLACKJACK VIEW
 # ==========================================
 class RoleButton(discord.ui.Button):
     def __init__(self, role_id: int, label: str):
@@ -281,6 +280,172 @@ class RolePanelView(discord.ui.View):
         super().__init__(timeout=None)
         for r_id, label in roles_list[:25]:
             self.add_item(RoleButton(r_id, label))
+
+
+class BlackjackView(discord.ui.View):
+    def __init__(self, ctx, bet: int):
+        super().__init__(timeout=45.0)
+        self.ctx = ctx
+        self.bet = bet
+        self.finished = False
+
+        suits = ["♠️", "♥️", "♦️", "♣️"]
+        ranks = [("2", 2), ("3", 3), ("4", 4), ("5", 5), ("6", 6), ("7", 7), ("8", 8),
+                 ("9", 9), ("10", 10), ("J", 10), ("Q", 10), ("K", 10), ("A", 11)]
+        self.deck = [(f"{r}{s}", v) for s in suits for r, v in ranks]
+        random.shuffle(self.deck)
+
+        self.player = [self.deck.pop(), self.deck.pop()]
+        self.dealer = [self.deck.pop(), self.deck.pop()]
+
+    def hand_score(self, hand):
+        total = sum(v for _, v in hand)
+        aces = sum(1 for _, v in hand if v == 11)
+        while total > 21 and aces:
+            total -= 10
+            aces -= 1
+        return total
+
+    def format_hand(self, hand, hide_second=False):
+        if hide_second:
+            return f"`[ {hand[0][0]} ]` `[ 🂠 ]`"
+        return " ".join(f"`[ {c} ]`" for c, _ in hand)
+
+    def build_embed(self, status_text: str, color=discord.Color.blurple(), reveal_dealer=False):
+        ps = self.hand_score(self.player)
+        ds = self.hand_score(self.dealer) if reveal_dealer else self.dealer[0][1]
+        em = discord.Embed(title="🃏 High-Stakes Blackjack", description=status_text, color=color)
+        em.add_field(
+            name=f"👤 {self.ctx.author.display_name}'s Hand ({ps})",
+            value=self.format_hand(self.player),
+            inline=False
+        )
+        em.add_field(
+            name=f"🎩 Dealer's Hand ({ds if reveal_dealer else f'{ds} + ?'})",
+            value=self.format_hand(self.dealer, hide_second=not reveal_dealer),
+            inline=False
+        )
+        em.set_footer(text=f"Wager: ${self.bet:,}")
+        return em
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.ctx.author.id:
+            await interaction.response.send_message("🚫 This isn't your Blackjack table! Start your own with `!bj <bet>`.", ephemeral=True)
+            return False
+        return True
+
+    async def resolve_dealer(self, interaction: discord.Interaction):
+        self.finished = True
+        for item in self.children:
+            item.disabled = True
+
+        await interaction.response.edit_message(
+            embed=self.build_embed("🎩 **Dealer flips their hidden card...**", discord.Color.gold(), reveal_dealer=True),
+            view=self
+        )
+        await asyncio.sleep(1.3)
+
+        while self.hand_score(self.dealer) < 17:
+            self.dealer.append(self.deck.pop())
+            await interaction.edit_original_response(
+                embed=self.build_embed("🎩 **Dealer draws a card...**", discord.Color.gold(), reveal_dealer=True),
+                view=self
+            )
+            await asyncio.sleep(1.1)
+
+        ps = self.hand_score(self.player)
+        ds = self.hand_score(self.dealer)
+        ud = get_user_data(self.ctx.guild.id, self.ctx.author.id)
+
+        if ds > 21 or ps > ds:
+            update_user_data(self.ctx.guild.id, self.ctx.author.id, balance=ud["balance"] + self.bet)
+            new_bal = ud["balance"] + self.bet
+            msg = f"🎉 **YOU WIN +${self.bet:,}!**\nNew Wallet: **${new_bal:,}**"
+            color = discord.Color.green()
+        elif ps < ds:
+            update_user_data(self.ctx.guild.id, self.ctx.author.id, balance=ud["balance"] - self.bet)
+            new_bal = ud["balance"] - self.bet
+            msg = f"💀 **DEALER WINS! You lost -${self.bet:,}.**\nNew Wallet: **${new_bal:,}**"
+            color = discord.Color.red()
+        else:
+            msg = f"🤝 **PUSH (TIE)!** Your **${self.bet:,}** bet was returned."
+            color = discord.Color.light_grey()
+
+        await interaction.edit_original_response(embed=self.build_embed(msg, color, reveal_dealer=True), view=self)
+        self.stop()
+
+    @discord.ui.button(label="🃏 Hit", style=discord.ButtonStyle.primary)
+    async def hit_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for child in self.children:
+            if getattr(child, "custom_id", "") == "bj_double":
+                child.disabled = True
+
+        self.player.append(self.deck.pop())
+        ps = self.hand_score(self.player)
+
+        if ps > 21:
+            self.finished = True
+            for item in self.children:
+                item.disabled = True
+            ud = get_user_data(self.ctx.guild.id, self.ctx.author.id)
+            update_user_data(self.ctx.guild.id, self.ctx.author.id, balance=ud["balance"] - self.bet)
+            em = self.build_embed(
+                f"💥 **BUST! ({ps})** You went over 21 and lost **-${self.bet:,}**.\nNew Wallet: **${ud['balance'] - self.bet:,}**",
+                discord.Color.red(),
+                reveal_dealer=True
+            )
+            await interaction.response.edit_message(embed=em, view=self)
+            self.stop()
+        elif ps == 21:
+            await self.resolve_dealer(interaction)
+        else:
+            await interaction.response.edit_message(
+                embed=self.build_embed("Choose your next move:", discord.Color.blurple(), reveal_dealer=False),
+                view=self
+            )
+
+    @discord.ui.button(label="🛑 Stand", style=discord.ButtonStyle.secondary)
+    async def stand_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.resolve_dealer(interaction)
+
+    @discord.ui.button(label="💰 Double Down", style=discord.ButtonStyle.success, custom_id="bj_double")
+    async def double_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        ud = get_user_data(self.ctx.guild.id, self.ctx.author.id)
+        if ud["balance"] < self.bet * 2:
+            return await interaction.response.send_message("❌ You don't have enough wallet cash to Double Down!", ephemeral=True)
+
+        self.bet *= 2
+        self.player.append(self.deck.pop())
+        ps = self.hand_score(self.player)
+
+        if ps > 21:
+            self.finished = True
+            for item in self.children:
+                item.disabled = True
+            update_user_data(self.ctx.guild.id, self.ctx.author.id, balance=ud["balance"] - self.bet)
+            em = self.build_embed(
+                f"💥 **DOUBLED & BUSTED! ({ps})** Lost **-${self.bet:,}**.\nNew Wallet: **${ud['balance'] - self.bet:,}**",
+                discord.Color.red(),
+                reveal_dealer=True
+            )
+            await interaction.response.edit_message(embed=em, view=self)
+            self.stop()
+        else:
+            await self.resolve_dealer(interaction)
+
+    async def on_timeout(self):
+        if not self.finished:
+            for item in self.children:
+                item.disabled = True
+            ud = get_user_data(self.ctx.guild.id, self.ctx.author.id)
+            update_user_data(self.ctx.guild.id, self.ctx.author.id, balance=ud["balance"] - self.bet)
+            try:
+                await self.message.edit(
+                    embed=self.build_embed(f"⏳ **Timed out!** You forfeited **-${self.bet:,}**.", discord.Color.red(), reveal_dealer=True),
+                    view=self
+                )
+            except Exception:
+                pass
 
 # ==========================================
 # 5. GLOBAL CHANNEL CHECK (#casino LOCK)
@@ -397,7 +562,6 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
     cfg = get_config(member.guild.id)
     jtc_id = cfg.get("jtc_channel")
 
-    # Join-To-Create Temporary Voice Channels (Premium Carl/Dyno feature)
     if after.channel and jtc_id and after.channel.id == jtc_id:
         overwrites = {
             member.guild.default_role: discord.PermissionOverwrite(connect=True),
@@ -422,7 +586,6 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
             except Exception:
                 pass
 
-    # Voice Audit Logging
     if before.channel != after.channel:
         if not before.channel and after.channel:
             await send_modlog(member.guild, "🔊 Voice Join", f"{member.mention} joined **{after.channel.name}**", discord.Color.teal())
@@ -557,7 +720,7 @@ async def on_message(message: discord.Message):
     cfg = get_config(g_id)
     is_admin = message.author.guild_permissions.manage_messages
 
-    # 0. Auto-Purge Channel Check (Premium feature)
+    # 0. Auto-Purge Channel Check
     c.execute("SELECT delay_seconds FROM autopurge_channels WHERE channel_id = ?", (message.channel.id,))
     ap_row = c.fetchone()
     if ap_row and not message.content.startswith(cfg["prefix"]):
@@ -614,7 +777,7 @@ async def on_message(message: discord.Message):
                 except discord.Forbidden:
                     pass
 
-    # 3. Auto-Responder Triggers (Carl-bot Premium feature)
+    # 3. Auto-Responder Triggers
     if not message.content.startswith(cfg["prefix"]):
         c.execute("SELECT keyword, response FROM triggers WHERE guild_id = ?", (g_id,))
         msg_lower = message.content.lower()
@@ -661,7 +824,7 @@ async def delayed_delete(message: discord.Message, delay: int):
         pass
 
 # ==========================================
-# 7. SERVER LOCKDOWN & UNLOCKDOWN (Smart Permission Backup)
+# 7. SERVER LOCKDOWN & UNLOCKDOWN
 # ==========================================
 @bot.command()
 @commands.has_permissions(administrator=True)
@@ -686,7 +849,7 @@ async def lockdown(ctx, *, reason: str = "Emergency Server Lockdown"):
     status_msg = await ctx.send("🚨 **Initiating Server-Wide Lockdown...** Backing up permissions and locking channels...")
     c.execute("SELECT channel_id FROM lockdown_ignored WHERE guild_id = ?", (ctx.guild.id,))
     ignored_ids = {r[0] for r in c.fetchall()}
-    ignored_ids.add(ctx.channel.id)  # Keep the command channel open for admins
+    ignored_ids.add(ctx.channel.id)
 
     c.execute("DELETE FROM lockdown_backups WHERE guild_id = ?", (ctx.guild.id,))
     locked_count = 0
@@ -696,7 +859,6 @@ async def lockdown(ctx, *, reason: str = "Emergency Server Lockdown"):
         if ch.id in ignored_ids:
             continue
         overwrite = ch.overwrites_for(default_role)
-        # Store previous send_messages state: 1 = True, 0 = False, -1 = None (inherit)
         prev_val = 1 if overwrite.send_messages is True else (0 if overwrite.send_messages is False else -1)
         c.execute("INSERT INTO lockdown_backups VALUES (?, ?, ?)", (ctx.guild.id, ch.id, prev_val))
         overwrite.send_messages = False
@@ -975,7 +1137,7 @@ async def badword(ctx, action: str, *, word: str):
         await ctx.send(f"✅ Removed `{word}` from the bad-word filter.")
 
 # ==========================================
-# 9. CARL-BOT PREMIUM SUITE (Triggers, Roles, Polls, Starboard, Snipe, Sticky)
+# 9. CARL-BOT PREMIUM SUITE
 # ==========================================
 @bot.command()
 @commands.has_permissions(administrator=True)
@@ -1244,16 +1406,18 @@ async def roleinfo(ctx, role: discord.Role):
     await ctx.send(embed=em)
 
 # ==========================================
-# 10. ECONOMY & CASINO COMMANDS (#casino ONLY)
+# 10. ECONOMY & SUSPENSE CASINO (#casino ONLY)
 # ==========================================
 @bot.command(aliases=["bal"])
 async def balance(ctx, member: discord.Member = None):
     m = member or ctx.author
     ud = get_user_data(ctx.guild.id, m.id)
     em = discord.Embed(title=f"💰 {m.display_name}'s Finances", color=discord.Color.green())
-    em.add_field(name="Wallet", value=f"${ud['balance']:,}")
-    em.add_field(name="Bank", value=f"${ud['bank']:,}")
-    em.add_field(name="Bounty", value=f"${ud['bounty']:,}")
+    em.set_thumbnail(url=m.display_avatar.url)
+    em.add_field(name="💵 Wallet", value=f"**${ud['balance']:,}**", inline=True)
+    em.add_field(name="🏦 Bank", value=f"**${ud['bank']:,}**", inline=True)
+    em.add_field(name="🎯 Bounty", value=f"**${ud['bounty']:,}**", inline=True)
+    em.set_footer(text=f"Net Worth: ${ud['balance'] + ud['bank']:,}")
     await ctx.send(embed=em)
 
 @bot.command()
@@ -1265,7 +1429,8 @@ async def daily(ctx):
         return await ctx.send(f"⏳ Come back in **{rem // 3600}h {(rem % 3600) // 60}m** for your next daily reward!")
     reward = random.randint(500, 1000)
     update_user_data(ctx.guild.id, ctx.author.id, balance=ud["balance"] + reward, last_daily=now)
-    await ctx.send(f"💵 You claimed your daily reward of **${reward:,}**!")
+    em = discord.Embed(title="💵 Daily Reward Claimed!", description=f"You collected **+${reward:,}**!\nNew Wallet: **${ud['balance'] + reward:,}**", color=discord.Color.green())
+    await ctx.send(embed=em)
 
 @bot.command()
 async def work(ctx):
@@ -1277,7 +1442,8 @@ async def work(ctx):
     jobs = ["coded a Discord bot", "fixed a server outage", "worked a shift at the casino", "won a local tournament"]
     earned = random.randint(150, 450)
     update_user_data(ctx.guild.id, ctx.author.id, balance=ud["balance"] + earned, last_work=now)
-    await ctx.send(f"💼 You {random.choice(jobs)} and earned **${earned:,}**!")
+    em = discord.Embed(title="💼 Shift Complete", description=f"You {random.choice(jobs)} and earned **+${earned:,}**!", color=discord.Color.green())
+    await ctx.send(embed=em)
 
 @bot.command()
 async def crime(ctx):
@@ -1286,17 +1452,21 @@ async def crime(ctx):
     if now - ud["last_crime"] < 3600:
         rem = 3600 - (now - ud["last_crime"])
         return await ctx.send(f"⏳ Lay low for **{rem // 60}m {rem % 60}s** before committing another crime.")
+
+    msg = await ctx.send(embed=discord.Embed(title="🕵️ Breaking into the Vault...", description="Picking the lock... stay quiet...", color=discord.Color.dark_grey()))
+    await asyncio.sleep(1.5)
+
     c.execute("SELECT quantity FROM inventory WHERE guild_id = ? AND user_id = ? AND item_name = 'Lucky Coin'", (ctx.guild.id, ctx.author.id))
     has_coin = (c.fetchone() or [0])[0] > 0
     chance = 0.60 if has_coin else 0.45
     if random.random() < chance:
         loot = random.randint(400, 1200)
         update_user_data(ctx.guild.id, ctx.author.id, balance=ud["balance"] + loot, last_crime=now)
-        await ctx.send(f"🕵️ Heist succeeded! You got away with **${loot:,}**!")
+        await msg.edit(embed=discord.Embed(title="💰 Heist Succeeded!", description=f"You escaped the scene with **+${loot:,}**!", color=discord.Color.green()))
     else:
         fine = min(ud["balance"], random.randint(200, 500))
         update_user_data(ctx.guild.id, ctx.author.id, balance=ud["balance"] - fine, last_crime=now)
-        await ctx.send(f"🚓 Busted! You paid a **${fine:,}** fine.")
+        await msg.edit(embed=discord.Embed(title="🚓 BUSTED!", description=f"Alarms went off! You paid a **-${fine:,}** fine.", color=discord.Color.red()))
 
 @bot.command(aliases=["dep"])
 async def deposit(ctx, amount: str):
@@ -1338,28 +1508,45 @@ async def give(ctx, member: discord.Member, amount: int):
     update_user_data(ctx.guild.id, member.id, balance=receiver["balance"] + amount)
     await ctx.send(f"💸 Sent **${amount:,}** to **{member.display_name}**!")
 
+# --- SUSPENSE SLOT MACHINE ---
 @bot.command()
 async def slots(ctx, bet: int):
     ud = get_user_data(ctx.guild.id, ctx.author.id)
     if bet <= 0 or bet > ud["balance"]:
         return await ctx.send("❌ Invalid bet amount.")
+
     emojis = ["🍒", "🍋", "🍇", "🔔", "💎", "7️⃣"]
-    msg = await ctx.send("🎰 Spinning... | ❓ | ❓ | ❓ |")
-    await asyncio.sleep(1.2)
     r = [random.choice(emojis) for _ in range(3)]
+
+    def slot_embed(disp, status, color=discord.Color.gold()):
+        em = discord.Embed(title="🎰 HIGH-ROLLER SLOTS", color=color)
+        em.add_field(name="━━━━━━ REELS ━━━━━━", value=f"## ➔  | {disp[0]} | {disp[1]} | {disp[2]} |  ⬅️", inline=False)
+        em.add_field(name="Status", value=status, inline=False)
+        em.set_footer(text=f"Player: {ctx.author.display_name} • Bet: ${bet:,}")
+        return em
+
+    msg = await ctx.send(embed=slot_embed(["❓", "❓", "❓"], "🔄 **Spinning all reels...**", discord.Color.blurple()))
+    await asyncio.sleep(0.9)
+    await msg.edit(embed=slot_embed([r[0], "❓", "❓"], "🔒 **Reel 1 locked! Two left...**", discord.Color.blurple()))
+    await asyncio.sleep(0.9)
+    await msg.edit(embed=slot_embed([r[0], r[1], "❓"], "🔥 **Reel 2 locked! Holding breath for Reel 3...**", discord.Color.orange()))
+    await asyncio.sleep(1.1)
+
     if r[0] == r[1] == r[2]:
         mult = 10 if r[0] == "7️⃣" else 5
         win = bet * mult
         update_user_data(ctx.guild.id, ctx.author.id, balance=ud["balance"] + win)
-        await msg.edit(content=f"🎰 | {r[0]} | {r[1]} | {r[2]} |\n🎉 **JACKPOT!** You won **${win:,}**!")
+        await msg.edit(embed=slot_embed(r, f"🎉 **MEGA JACKPOT ({mult}x)! You won +${win:,}!**\nNew Wallet: **${ud['balance'] + win:,}**", discord.Color.gold()))
     elif r[0] == r[1] or r[1] == r[2] or r[0] == r[2]:
         win = int(bet * 1.5)
-        update_user_data(ctx.guild.id, ctx.author.id, balance=ud["balance"] + (win - bet))
-        await msg.edit(content=f"🎰 | {r[0]} | {r[1]} | {r[2]} |\n✨ Two matched! You won **${win:,}**!")
+        profit = win - bet
+        update_user_data(ctx.guild.id, ctx.author.id, balance=ud["balance"] + profit)
+        await msg.edit(embed=slot_embed(r, f"✨ **DOUBLE MATCH! You won +${profit:,}!**\nNew Wallet: **${ud['balance'] + profit:,}**", discord.Color.green()))
     else:
         update_user_data(ctx.guild.id, ctx.author.id, balance=ud["balance"] - bet)
-        await msg.edit(content=f"🎰 | {r[0]} | {r[1]} | {r[2]} |\n💀 You lost **${bet:,}**.")
+        await msg.edit(embed=slot_embed(r, f"💀 **NO MATCH! You lost -${bet:,}.**\nNew Wallet: **${ud['balance'] - bet:,}**", discord.Color.red()))
 
+# --- SUSPENSE COINFLIP ---
 @bot.command(aliases=["cf"])
 async def coinflip(ctx, side: str, bet: int):
     side = side.lower()
@@ -1369,14 +1556,33 @@ async def coinflip(ctx, side: str, bet: int):
     ud = get_user_data(ctx.guild.id, ctx.author.id)
     if bet <= 0 or bet > ud["balance"]:
         return await ctx.send("❌ Invalid bet amount.")
+
+    em1 = discord.Embed(title="🪙 Coin Flip", description=f"You called **{choice.upper()}** for **${bet:,}**...\n\n🔄 *Flipping the coin into the air...*", color=discord.Color.blurple())
+    msg = await ctx.send(embed=em1)
+    await asyncio.sleep(1.0)
+
+    em2 = discord.Embed(title="🪙 Coin Flip", description=f"You called **{choice.upper()}** for **${bet:,}**...\n\n💫 *Spinning fast... about to land...*", color=discord.Color.orange())
+    await msg.edit(embed=em2)
+    await asyncio.sleep(1.1)
+
     result = random.choice(["heads", "tails"])
     if choice == result:
         update_user_data(ctx.guild.id, ctx.author.id, balance=ud["balance"] + bet)
-        await ctx.send(f"🪙 Landed on **{result.upper()}**! You won **${bet:,}**!")
+        em3 = discord.Embed(
+            title=f"🎉 IT LANDED ON {result.upper()}!",
+            description=f"You called it right and won **+${bet:,}**!\nNew Wallet: **${ud['balance'] + bet:,}**",
+            color=discord.Color.green()
+        )
     else:
         update_user_data(ctx.guild.id, ctx.author.id, balance=ud["balance"] - bet)
-        await ctx.send(f"🪙 Landed on **{result.upper()}**! You lost **${bet:,}**.")
+        em3 = discord.Embed(
+            title=f"💀 IT LANDED ON {result.upper()}!",
+            description=f"Tough luck! You lost **-${bet:,}**.\nNew Wallet: **${ud['balance'] - bet:,}**",
+            color=discord.Color.red()
+        )
+    await msg.edit(embed=em3)
 
+# --- SUSPENSE ROULETTE ---
 @bot.command()
 async def roulette(ctx, color: str, bet: int):
     color = color.lower()
@@ -1385,65 +1591,60 @@ async def roulette(ctx, color: str, bet: int):
     ud = get_user_data(ctx.guild.id, ctx.author.id)
     if bet <= 0 or bet > ud["balance"]:
         return await ctx.send("❌ Invalid bet amount.")
+
+    em1 = discord.Embed(title="🎡 Casino Roulette", description=f"Betting **${bet:,}** on **{color.upper()}**\n\n🔄 `🔴 ➔ ⚫ ➔ 🔴 ➔ ⚫ ➔ 🟢` *Ball spinning fast...*", color=discord.Color.blurple())
+    msg = await ctx.send(embed=em1)
+    await asyncio.sleep(1.1)
+
+    em2 = discord.Embed(title="🎡 Casino Roulette", description=f"Betting **${bet:,}** on **{color.upper()}**\n\n⏳ `⚫ ➔ 🔴 ➔ 🟢 ➔ ⚫` *Ball bouncing across the pockets...*", color=discord.Color.orange())
+    await msg.edit(embed=em2)
+    await asyncio.sleep(1.2)
+
     roll = random.choices(["red", "black", "green"], weights=[48, 48, 4])[0]
+    ball_icon = "🔴" if roll == "red" else ("⚫" if roll == "black" else "🟢")
+
     if color == roll:
         mult = 14 if roll == "green" else 2
         win = bet * mult
-        update_user_data(ctx.guild.id, ctx.author.id, balance=ud["balance"] + (win - bet))
-        await ctx.send(f"🎡 The ball landed on **{roll.upper()}**! You won **${win:,}**!")
+        profit = win - bet
+        update_user_data(ctx.guild.id, ctx.author.id, balance=ud["balance"] + profit)
+        em3 = discord.Embed(
+            title=f"🎉 {ball_icon} LANDED ON {roll.upper()}!",
+            description=f"Multiplier: **{mult}x** — You won **+${profit:,}**!\nNew Wallet: **${ud['balance'] + profit:,}**",
+            color=discord.Color.green()
+        )
     else:
         update_user_data(ctx.guild.id, ctx.author.id, balance=ud["balance"] - bet)
-        await ctx.send(f"🎡 The ball landed on **{roll.upper()}**! You lost **${bet:,}**.")
+        em3 = discord.Embed(
+            title=f"💀 {ball_icon} LANDED ON {roll.upper()}!",
+            description=f"You bet on **{color.upper()}** and lost **-${bet:,}**.\nNew Wallet: **${ud['balance'] - bet:,}**",
+            color=discord.Color.red()
+        )
+    await msg.edit(embed=em3)
 
+# --- INTERACTIVE BUTTON BLACKJACK ---
 @bot.command(aliases=["bj"])
 async def blackjack(ctx, bet: int):
     ud = get_user_data(ctx.guild.id, ctx.author.id)
     if bet <= 0 or bet > ud["balance"]:
         return await ctx.send("❌ Invalid bet amount.")
-    deck = [2, 3, 4, 5, 6, 7, 8, 9, 10, 10, 10, 10, 11] * 4
-    random.shuffle(deck)
-    player = [deck.pop(), deck.pop()]
-    dealer = [deck.pop(), deck.pop()]
 
-    def score(hand):
-        s = sum(hand)
-        aces = hand.count(11)
-        while s > 21 and aces:
-            s -= 10
-            aces -= 1
-        return s
+    view = BlackjackView(ctx, bet)
+    ps = view.hand_score(view.player)
 
-    await ctx.send(f"🃏 **Blackjack** | Your hand: `{player}` (**{score(player)}**) | Dealer shows: `{dealer[0]}`\nType `hit` or `stand`.")
+    # Instant Natural Blackjack Check
+    if ps == 21:
+        payout = int(bet * 1.5)
+        update_user_data(ctx.guild.id, ctx.author.id, balance=ud["balance"] + payout)
+        em = view.build_embed(
+            f"🃏 **NATURAL BLACKJACK! (21)**\nInstant 2.5x payout: **+${payout:,}**!\nNew Wallet: **${ud['balance'] + payout:,}**",
+            discord.Color.gold(),
+            reveal_dealer=True
+        )
+        return await ctx.send(embed=em)
 
-    def check(m):
-        return m.author == ctx.author and m.channel == ctx.channel and m.content.lower() in ("hit", "stand")
-
-    while score(player) < 21:
-        try:
-            reply = await bot.wait_for("message", timeout=25.0, check=check)
-        except asyncio.TimeoutError:
-            break
-        if reply.content.lower() == "hit":
-            player.append(deck.pop())
-            if score(player) > 21:
-                update_user_data(ctx.guild.id, ctx.author.id, balance=ud["balance"] - bet)
-                return await ctx.send(f"💥 Bust! Your hand: `{player}` (**{score(player)}**). You lost **${bet:,}**.")
-            await ctx.send(f"🃏 Your hand: `{player}` (**{score(player)}**). `hit` or `stand`?")
-        else:
-            break
-
-    while score(dealer) < 17:
-        dealer.append(deck.pop())
-
-    ps, ds = score(player), score(dealer)
-    if ds > 21 or ps > ds:
-        update_user_data(ctx.guild.id, ctx.author.id, balance=ud["balance"] + bet)
-        await ctx.send(f"🎉 You win! You: **{ps}** | Dealer: `{dealer}` (**{ds}**). Won **${bet:,}**!")
-    elif ps < ds:
-        update_user_data(ctx.guild.id, ctx.author.id, balance=ud["balance"] - bet)
-        await ctx.send(f"💀 Dealer wins! You: **{ps}** | Dealer: `{dealer}` (**{ds}**). Lost **${bet:,}**.")
-    else:
-        await ctx.send(f"🤝 Push (Tie)! Both had **{ps}**.")
+    em = view.build_embed("Click **Hit**, **Stand**, or **Double Down** below!", discord.Color.blurple(), reveal_dealer=False)
+    view.message = await ctx.send(embed=em, view=view)
 
 @bot.command()
 async def rob(ctx, target: discord.Member):
@@ -1454,12 +1655,15 @@ async def rob(ctx, target: discord.Member):
     if victim["balance"] < 200 and victim["bounty"] <= 0:
         return await ctx.send("They don't have enough cash or a bounty worth robbing!")
 
+    msg = await ctx.send(embed=discord.Embed(title="🦹 Sneaking up on target...", description=f"Reaching for **{target.display_name}**'s wallet...", color=discord.Color.dark_grey()))
+    await asyncio.sleep(1.3)
+
     c.execute("SELECT quantity FROM inventory WHERE guild_id = ? AND user_id = ? AND item_name = 'Padlock'", (ctx.guild.id, target.id))
     lock_row = c.fetchone()
     if lock_row and lock_row[0] > 0:
         c.execute("UPDATE inventory SET quantity = quantity - 1 WHERE guild_id = ? AND user_id = ? AND item_name = 'Padlock'", (ctx.guild.id, target.id))
         conn.commit()
-        return await ctx.send(f"🔒 **{target.display_name}** had a **Padlock**! Your robbery failed and broke their lock.")
+        return await msg.edit(embed=discord.Embed(title="🔒 PADLOCK TRIGGERED!", description=f"**{target.display_name}** had a **Padlock**! Your robbery failed and broke their lock.", color=discord.Color.orange()))
 
     c.execute("SELECT quantity FROM inventory WHERE guild_id = ? AND user_id = ? AND item_name = 'Lucky Coin'", (ctx.guild.id, ctx.author.id))
     has_coin = (c.fetchone() or [0])[0] > 0
@@ -1471,12 +1675,12 @@ async def rob(ctx, target: discord.Member):
         total_gain = stolen + bounty_payout
         update_user_data(ctx.guild.id, ctx.author.id, balance=robber["balance"] + total_gain)
         update_user_data(ctx.guild.id, target.id, balance=victim["balance"] - stolen, bounty=0)
-        bounty_txt = f" + **${bounty_payout:,}** bounty claimed!" if bounty_payout > 0 else "!"
-        await ctx.send(f"🦹 You robbed **${stolen:,}** from **{target.display_name}**{bounty_txt}")
+        bounty_txt = f"\n🎯 **Bounty Claimed:** +${bounty_payout:,}" if bounty_payout > 0 else ""
+        await msg.edit(embed=discord.Embed(title="🦹 ROBBERY SUCCESSFUL!", description=f"You stole **${stolen:,}** from **{target.display_name}**!{bounty_txt}", color=discord.Color.green()))
     else:
         fine = min(robber["balance"], 250)
         update_user_data(ctx.guild.id, ctx.author.id, balance=robber["balance"] - fine)
-        await ctx.send(f"🚓 You got caught and paid a **${fine:,}** fine!")
+        await msg.edit(embed=discord.Embed(title="🚓 CAUGHT RED-HANDED!", description=f"You got caught and paid a **-${fine:,}** fine!", color=discord.Color.red()))
 
 @bot.command()
 async def bounty(ctx, target: discord.Member, amount: int):
@@ -1528,10 +1732,16 @@ async def openbox(ctx):
         return await ctx.send("📦 You don't have any Mystery Boxes! Buy one from `!shop`.")
     c.execute("UPDATE inventory SET quantity = quantity - 1 WHERE guild_id = ? AND user_id = ? AND item_name = 'Mystery Box'", (ctx.guild.id, ctx.author.id))
     conn.commit()
+
+    msg = await ctx.send(embed=discord.Embed(title="📦 Opening Mystery Box...", description="🔄 *Shaking the box... something heavy is inside...*", color=discord.Color.blurple()))
+    await asyncio.sleep(1.1)
+    await msg.edit(embed=discord.Embed(title="✨ Breaking the Seal...", description="💫 *Golden light glowing through the cracks...*", color=discord.Color.orange()))
+    await asyncio.sleep(1.1)
+
     prize = random.randint(500, 4000)
     ud = get_user_data(ctx.guild.id, ctx.author.id)
     update_user_data(ctx.guild.id, ctx.author.id, balance=ud["balance"] + prize)
-    await ctx.send(f"🎁 You opened a **Mystery Box** and found **${prize:,}**!")
+    await msg.edit(embed=discord.Embed(title="🎁 MYSTERY BOX OPENED!", description=f"You found **+${prize:,}** inside!\nNew Wallet: **${ud['balance'] + prize:,}**", color=discord.Color.gold()))
 
 @bot.command(aliases=["lb"])
 async def leaderboard(ctx):
