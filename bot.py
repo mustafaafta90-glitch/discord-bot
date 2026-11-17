@@ -1133,6 +1133,12 @@ async def tag_list(ctx):
     c.execute("SELECT name, uses FROM tags WHERE guild_id = ?", (ctx.guild.id,))
     rows = c.fetchall()
     await ctx.send("🏷️ **Tags:** " + (", ".join([f"`{r[0]}` ({r[1]})" for r in rows]) if rows else "None"))
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def reseteconomy(ctx):
+    c.execute("UPDATE users SET balance = 500, bank = 0 WHERE guild_id = ?", (ctx.guild.id,))
+    conn.commit()
+    await ctx.send(embed=discord.Embed(title="♻️ Economy Reset", description="All player wallets have been reset to $500 and banks to $0!", color=discord.Color.red()))
 
 @bot.command()
 @commands.has_permissions(manage_messages=True)
