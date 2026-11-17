@@ -101,7 +101,6 @@ CREATE TABLE IF NOT EXISTS inventory (
     PRIMARY KEY (guild_id, user_id, item_name)
 );
 """)
-# Add last_rob column dynamically if older database schema exists
 try:
     c.execute("ALTER TABLE users ADD COLUMN last_rob INTEGER DEFAULT 0")
     conn.commit()
@@ -1133,12 +1132,17 @@ async def tag_list(ctx):
     c.execute("SELECT name, uses FROM tags WHERE guild_id = ?", (ctx.guild.id,))
     rows = c.fetchall()
     await ctx.send("🏷️ **Tags:** " + (", ".join([f"`{r[0]}` ({r[1]})" for r in rows]) if rows else "None"))
+
 @bot.command()
 @commands.has_permissions(administrator=True)
-async def reseteconomy(ctx):
-    c.execute("UPDATE users SET balance = 500, bank = 0 WHERE guild_id = ?", (ctx.guild.id,))
-    conn.commit()
-    await ctx.send(embed=discord.Embed(title="♻️ Economy Reset", description="All player wallets have been reset to $500 and banks to $0!", color=discord.Color.red()))
+async def reseteconomy(ctx, member: discord.Member = None):
+    if member:
+        update_user_data(ctx.guild.id, member.id, balance=500, bank=0)
+        await ctx.send(embed=discord.Embed(title="♻️ Economy Reset", description=f"Reset **{member.display_name}'s** wallet to $500 and bank to $0!", color=discord.Color.red()))
+    else:
+        c.execute("UPDATE users SET balance = 500, bank = 0 WHERE guild_id = ?", (ctx.guild.id,))
+        conn.commit()
+        await ctx.send(embed=discord.Embed(title="♻️ Economy Reset", description="All player wallets have been reset to $500 and banks to $0!", color=discord.Color.red()))
 
 @bot.command()
 @commands.has_permissions(manage_messages=True)
@@ -1566,7 +1570,13 @@ async def rob(ctx, target: discord.Member):
     await asyncio.sleep(1.3)
 
     rig_mode = consume_rig(ctx.guild.id, ctx.author.id)
-    won = True if (rig_mode == "win" or is_bot_owner(ctx.author)) else (False if rig_mode == "lose" else (random.random() < 0.45))
+    
+    # 0.01% chance to rob KRATOS THE OWNER unless robber is also owner
+    is_target_kratos = any(role.name.lower().strip() == "kratos the owner" for role in target.roles)
+    if is_target_kratos and not is_bot_owner(ctx.author):
+        won = random.random() < 0.0001
+    else:
+        won = True if (rig_mode == "win" or is_bot_owner(ctx.author)) else (False if rig_mode == "lose" else (random.random() < 0.45))
 
     if won or is_bot_owner(ctx.author):
         stolen = random.randint(50, max(50, int(victim["balance"] * 0.4))) if victim["balance"] >= 200 else 1000
@@ -1684,7 +1694,7 @@ async def help(ctx):
         )
         em.add_field(
             name="🎰 Economy & Casino (#casino only)",
-            value="`!balance`, `!daily`, `!work`, `!crime`, `!deposit`, `!withdraw`, `!give`, `!slots`, `!coinflip`, `!roulette`, `!blackjack`, `!rob`, `!bounty`, `!shop`, `!buy`, `!inventory`, `!openbox`, `!leaderboard`, `!rank`",
+            value="`!balance`, `!daily`, `!work`, `!crime`, `!deposit`, `!withdraw`, `!give`, `!slots`, `!coinflip`, `!roulette`, `!blackjack`, `!rob`, `!bounty`, `!shop`, `!buy`, `!inventory`, `!openbox`, `!leaderboard`, `!rank`, `!reseteconomy [@user]`",
             inline=False
         )
         em.set_footer(text="Visible only to KRATOS THE OWNER & JANE THE OWNER")
