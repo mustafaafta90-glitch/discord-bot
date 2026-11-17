@@ -17,7 +17,7 @@ app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "Bot is online and running!"
+    return "PCB BOT is online and running!"
 
 def run_web():
     port = int(os.environ.get("PORT", 8080))
@@ -215,6 +215,16 @@ SHOP_ITEMS = {
     "Bank Expansion": {"price": 3000, "desc": "A prestige item for top earners."},
     "Mystery Box": {"price": 1500, "desc": "Use !openbox for a suspenseful cash reveal!"}
 }
+
+def parse_bet(bet_str: str, balance: int) -> int:
+    s = bet_str.lower().strip()
+    if s == "all":
+        return balance
+    if s == "half":
+        return balance // 2
+    if s.isdigit():
+        return int(s)
+    return 0
 
 def parse_duration(duration_str: str) -> int:
     match = re.match(r"^(\d+)([smhd])$", duration_str.lower())
@@ -1471,12 +1481,7 @@ async def crime(ctx):
 @bot.command(aliases=["dep"])
 async def deposit(ctx, amount: str):
     ud = get_user_data(ctx.guild.id, ctx.author.id)
-    if amount.lower() == "all":
-        amt = ud["balance"]
-    elif amount.isdigit():
-        amt = int(amount)
-    else:
-        return await ctx.send("❌ Enter a valid number or `all`.")
+    amt = parse_bet(amount, ud["balance"])
     if amt <= 0 or amt > ud["balance"]:
         return await ctx.send("❌ Invalid deposit amount.")
     update_user_data(ctx.guild.id, ctx.author.id, balance=ud["balance"] - amt, bank=ud["bank"] + amt)
@@ -1485,12 +1490,7 @@ async def deposit(ctx, amount: str):
 @bot.command(aliases=["with"])
 async def withdraw(ctx, amount: str):
     ud = get_user_data(ctx.guild.id, ctx.author.id)
-    if amount.lower() == "all":
-        amt = ud["bank"]
-    elif amount.isdigit():
-        amt = int(amount)
-    else:
-        return await ctx.send("❌ Enter a valid number or `all`.")
+    amt = parse_bet(amount, ud["bank"])
     if amt <= 0 or amt > ud["bank"]:
         return await ctx.send("❌ Invalid withdrawal amount.")
     update_user_data(ctx.guild.id, ctx.author.id, balance=ud["balance"] + amt, bank=ud["bank"] - amt)
@@ -1510,10 +1510,11 @@ async def give(ctx, member: discord.Member, amount: int):
 
 # --- SUSPENSE SLOT MACHINE ---
 @bot.command()
-async def slots(ctx, bet: int):
+async def slots(ctx, bet: str):
     ud = get_user_data(ctx.guild.id, ctx.author.id)
-    if bet <= 0 or bet > ud["balance"]:
-        return await ctx.send("❌ Invalid bet amount.")
+    amt = parse_bet(bet, ud["balance"])
+    if amt <= 0 or amt > ud["balance"]:
+        return await ctx.send("❌ Invalid bet amount. Usage: `!slots <amount|all|half>`")
 
     emojis = ["🍒", "🍋", "🍇", "🔔", "💎", "7️⃣"]
     r = [random.choice(emojis) for _ in range(3)]
@@ -1522,7 +1523,7 @@ async def slots(ctx, bet: int):
         em = discord.Embed(title="🎰 HIGH-ROLLER SLOTS", color=color)
         em.add_field(name="━━━━━━ REELS ━━━━━━", value=f"## ➔  | {disp[0]} | {disp[1]} | {disp[2]} |  ⬅️", inline=False)
         em.add_field(name="Status", value=status, inline=False)
-        em.set_footer(text=f"Player: {ctx.author.display_name} • Bet: ${bet:,}")
+        em.set_footer(text=f"Player: {ctx.author.display_name} • Bet: ${amt:,}")
         return em
 
     msg = await ctx.send(embed=slot_embed(["❓", "❓", "❓"], "🔄 **Spinning all reels...**", discord.Color.blurple()))
@@ -1534,79 +1535,100 @@ async def slots(ctx, bet: int):
 
     if r[0] == r[1] == r[2]:
         mult = 10 if r[0] == "7️⃣" else 5
-        win = bet * mult
+        win = amt * mult
         update_user_data(ctx.guild.id, ctx.author.id, balance=ud["balance"] + win)
         await msg.edit(embed=slot_embed(r, f"🎉 **MEGA JACKPOT ({mult}x)! You won +${win:,}!**\nNew Wallet: **${ud['balance'] + win:,}**", discord.Color.gold()))
     elif r[0] == r[1] or r[1] == r[2] or r[0] == r[2]:
-        win = int(bet * 1.5)
-        profit = win - bet
+        win = int(amt * 1.5)
+        profit = win - amt
         update_user_data(ctx.guild.id, ctx.author.id, balance=ud["balance"] + profit)
         await msg.edit(embed=slot_embed(r, f"✨ **DOUBLE MATCH! You won +${profit:,}!**\nNew Wallet: **${ud['balance'] + profit:,}**", discord.Color.green()))
     else:
-        update_user_data(ctx.guild.id, ctx.author.id, balance=ud["balance"] - bet)
-        await msg.edit(embed=slot_embed(r, f"💀 **NO MATCH! You lost -${bet:,}.**\nNew Wallet: **${ud['balance'] - bet:,}**", discord.Color.red()))
+        update_user_data(ctx.guild.id, ctx.author.id, balance=ud["balance"] - amt)
+        await msg.edit(embed=slot_embed(r, f"💀 **NO MATCH! You lost -${amt:,}.**\nNew Wallet: **${ud['balance'] - amt:,}**", discord.Color.red()))
 
-# --- SUSPENSE COINFLIP ---
+# --- SUSPENSE COINFLIP (!cf 200 heads) ---
 @bot.command(aliases=["cf"])
-async def coinflip(ctx, side: str, bet: int):
+async def coinflip(ctx, bet: str, side: str = "heads"):
+    ud = get_user_data(ctx.guild.id, ctx.author.id)
+    amt = parse_bet(bet, ud["balance"])
     side = side.lower()
     if side not in ("heads", "tails", "h", "t"):
-        return await ctx.send("Choose `heads` or `tails`! Example: `!cf heads 100`")
+        return await ctx.send("Choose `heads` or `tails`! Example: `!cf 200 heads`")
+    if amt <= 0 or amt > ud["balance"]:
+        return await ctx.send("❌ Invalid bet amount. Example: `!cf 200 heads`")
     choice = "heads" if side in ("heads", "h") else "tails"
-    ud = get_user_data(ctx.guild.id, ctx.author.id)
-    if bet <= 0 or bet > ud["balance"]:
-        return await ctx.send("❌ Invalid bet amount.")
 
-    em1 = discord.Embed(title="🪙 Coin Flip", description=f"You called **{choice.upper()}** for **${bet:,}**...\n\n🔄 *Flipping the coin into the air...*", color=discord.Color.blurple())
+    em1 = discord.Embed(
+        title="🪙 Coin Flip",
+        description=f"Wager: **${amt:,}** on **{choice.upper()}**\n\n🔄 *Tossing the coin high into the air...*",
+        color=discord.Color.blurple()
+    )
     msg = await ctx.send(embed=em1)
     await asyncio.sleep(1.0)
 
-    em2 = discord.Embed(title="🪙 Coin Flip", description=f"You called **{choice.upper()}** for **${bet:,}**...\n\n💫 *Spinning fast... about to land...*", color=discord.Color.orange())
+    em2 = discord.Embed(
+        title="🪙 Coin Flip",
+        description=f"Wager: **${amt:,}** on **{choice.upper()}**\n\n💫 *Spinning fast... about to hit the table...*",
+        color=discord.Color.orange()
+    )
     await msg.edit(embed=em2)
     await asyncio.sleep(1.1)
 
     result = random.choice(["heads", "tails"])
     if choice == result:
-        update_user_data(ctx.guild.id, ctx.author.id, balance=ud["balance"] + bet)
+        update_user_data(ctx.guild.id, ctx.author.id, balance=ud["balance"] + amt)
         em3 = discord.Embed(
             title=f"🎉 IT LANDED ON {result.upper()}!",
-            description=f"You called it right and won **+${bet:,}**!\nNew Wallet: **${ud['balance'] + bet:,}**",
+            description=f"You called **{choice.upper()}** and won **+${amt:,}**!\nNew Wallet: **${ud['balance'] + amt:,}**",
             color=discord.Color.green()
         )
     else:
-        update_user_data(ctx.guild.id, ctx.author.id, balance=ud["balance"] - bet)
+        update_user_data(ctx.guild.id, ctx.author.id, balance=ud["balance"] - amt)
         em3 = discord.Embed(
             title=f"💀 IT LANDED ON {result.upper()}!",
-            description=f"Tough luck! You lost **-${bet:,}**.\nNew Wallet: **${ud['balance'] - bet:,}**",
+            description=f"You called **{choice.upper()}** and lost **-${amt:,}**.\nNew Wallet: **${ud['balance'] - amt:,}**",
             color=discord.Color.red()
         )
     await msg.edit(embed=em3)
 
-# --- SUSPENSE ROULETTE ---
+# --- SUSPENSE ROULETTE (!roulette 200 red) ---
 @bot.command()
-async def roulette(ctx, color: str, bet: int):
-    color = color.lower()
-    if color not in ("red", "black", "green"):
-        return await ctx.send("Choose `red`, `black`, or `green`! Example: `!roulette red 200`")
+async def roulette(ctx, bet: str, color: str):
     ud = get_user_data(ctx.guild.id, ctx.author.id)
-    if bet <= 0 or bet > ud["balance"]:
-        return await ctx.send("❌ Invalid bet amount.")
+    amt = parse_bet(bet, ud["balance"])
+    color = color.lower()
+    if color not in ("red", "black", "green", "r", "b", "g"):
+        return await ctx.send("Choose `red`, `black`, or `green`! Example: `!roulette 200 red`")
+    if amt <= 0 or amt > ud["balance"]:
+        return await ctx.send("❌ Invalid bet amount. Example: `!roulette 200 red`")
 
-    em1 = discord.Embed(title="🎡 Casino Roulette", description=f"Betting **${bet:,}** on **{color.upper()}**\n\n🔄 `🔴 ➔ ⚫ ➔ 🔴 ➔ ⚫ ➔ 🟢` *Ball spinning fast...*", color=discord.Color.blurple())
+    color_map = {"r": "red", "red": "red", "b": "black", "black": "black", "g": "green", "green": "green"}
+    chosen = color_map[color]
+
+    em1 = discord.Embed(
+        title="🎡 Casino Roulette",
+        description=f"Betting **${amt:,}** on **{chosen.upper()}**\n\n🔄 `🔴 ➔ ⚫ ➔ 🔴 ➔ ⚫ ➔ 🟢` *Wheel spinning fast...*",
+        color=discord.Color.blurple()
+    )
     msg = await ctx.send(embed=em1)
     await asyncio.sleep(1.1)
 
-    em2 = discord.Embed(title="🎡 Casino Roulette", description=f"Betting **${bet:,}** on **{color.upper()}**\n\n⏳ `⚫ ➔ 🔴 ➔ 🟢 ➔ ⚫` *Ball bouncing across the pockets...*", color=discord.Color.orange())
+    em2 = discord.Embed(
+        title="🎡 Casino Roulette",
+        description=f"Betting **${amt:,}** on **{chosen.upper()}**\n\n⏳ `⚫ ➔ 🔴 ➔ 🟢 ➔ ⚫` *Ball slowing down across the pockets...*",
+        color=discord.Color.orange()
+    )
     await msg.edit(embed=em2)
     await asyncio.sleep(1.2)
 
     roll = random.choices(["red", "black", "green"], weights=[48, 48, 4])[0]
     ball_icon = "🔴" if roll == "red" else ("⚫" if roll == "black" else "🟢")
 
-    if color == roll:
+    if chosen == roll:
         mult = 14 if roll == "green" else 2
-        win = bet * mult
-        profit = win - bet
+        win = amt * mult
+        profit = win - amt
         update_user_data(ctx.guild.id, ctx.author.id, balance=ud["balance"] + profit)
         em3 = discord.Embed(
             title=f"🎉 {ball_icon} LANDED ON {roll.upper()}!",
@@ -1614,27 +1636,27 @@ async def roulette(ctx, color: str, bet: int):
             color=discord.Color.green()
         )
     else:
-        update_user_data(ctx.guild.id, ctx.author.id, balance=ud["balance"] - bet)
+        update_user_data(ctx.guild.id, ctx.author.id, balance=ud["balance"] - amt)
         em3 = discord.Embed(
             title=f"💀 {ball_icon} LANDED ON {roll.upper()}!",
-            description=f"You bet on **{color.upper()}** and lost **-${bet:,}**.\nNew Wallet: **${ud['balance'] - bet:,}**",
+            description=f"You bet on **{chosen.upper()}** and lost **-${amt:,}**.\nNew Wallet: **${ud['balance'] - amt:,}**",
             color=discord.Color.red()
         )
     await msg.edit(embed=em3)
 
-# --- INTERACTIVE BUTTON BLACKJACK ---
+# --- INTERACTIVE BUTTON BLACKJACK (!bj 200) ---
 @bot.command(aliases=["bj"])
-async def blackjack(ctx, bet: int):
+async def blackjack(ctx, bet: str):
     ud = get_user_data(ctx.guild.id, ctx.author.id)
-    if bet <= 0 or bet > ud["balance"]:
-        return await ctx.send("❌ Invalid bet amount.")
+    amt = parse_bet(bet, ud["balance"])
+    if amt <= 0 or amt > ud["balance"]:
+        return await ctx.send("❌ Invalid bet amount. Example: `!bj 200`")
 
-    view = BlackjackView(ctx, bet)
+    view = BlackjackView(ctx, amt)
     ps = view.hand_score(view.player)
 
-    # Instant Natural Blackjack Check
     if ps == 21:
-        payout = int(bet * 1.5)
+        payout = int(amt * 1.5)
         update_user_data(ctx.guild.id, ctx.author.id, balance=ud["balance"] + payout)
         em = view.build_embed(
             f"🃏 **NATURAL BLACKJACK! (21)**\nInstant 2.5x payout: **+${payout:,}**!\nNew Wallet: **${ud['balance'] + payout:,}**",
@@ -1798,7 +1820,7 @@ async def help(ctx):
         )
         em.add_field(
             name="🎲 Casino Games",
-            value="`!slots <bet>`, `!coinflip <heads|tails> <bet>`, `!roulette <red|black|green> <bet>`, `!blackjack <bet>`",
+            value="`!slots <bet>`, `!coinflip <bet> <heads|tails>`, `!roulette <bet> <red|black|green>`, `!blackjack <bet>`",
             inline=False
         )
         em.add_field(
